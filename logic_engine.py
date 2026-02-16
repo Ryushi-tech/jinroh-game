@@ -231,10 +231,8 @@ def cmd_vote(args):
     target = get_player(state, executed)
     target["alive"] = False
 
-    # 霊媒結果: 人狼か人間かのみ公開（具体的な役職は非公開）
+    # 霊媒結果: 内部ログに記録（公開は霊媒師のCOによる。自動表示しない）
     alignment = "werewolf" if target["role"] == "werewolf" else "human"
-    alignment_jp = "人狼" if alignment == "werewolf" else "人間"
-    print(f"[霊媒結果] {executed} は【{alignment_jp}】だった")
 
     state["log"].append({
         "day": state["day"], "phase": "day_vote", "type": "execute",

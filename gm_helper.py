@@ -84,7 +84,7 @@ def cmd_setup():
     selected = random.sample(all_names, 9)
     roles = [
         "werewolf", "werewolf", "madman", "seer",
-        "bodyguard", "villager", "villager", "villager", "villager",
+        "medium", "bodyguard", "villager", "villager", "villager",
     ]
     random.shuffle(roles)
     players = [{"name": n, "role": r, "alive": True}
@@ -109,7 +109,7 @@ def cmd_setup():
     p = get_player(state, player_char)
     role_jp = {
         "villager": "村人", "werewolf": "人狼", "seer": "占い師",
-        "bodyguard": "狩人", "madman": "狂人",
+        "medium": "霊媒師", "bodyguard": "狩人", "madman": "狂人",
     }
     print(f"PLAYER_NAME={player_char}")
     print(f"PLAYER_ROLE={role_jp.get(p['role'], p['role'])}")

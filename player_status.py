@@ -110,6 +110,17 @@ def private_info(state, player):
                 result_jp = "護衛された" if entry.get("result") == "guarded" else "成功"
                 info.append(f"  Night {entry['day']}: {entry['target']} を襲撃 → {result_jp}")
 
+    elif role == "medium":
+        for entry in state["log"]:
+            if entry["type"] == "execute":
+                alignment = entry.get("alignment")
+                if alignment:
+                    result_jp = "人狼" if alignment == "werewolf" else "人間"
+                else:
+                    target = get_player(state, entry["target"])
+                    result_jp = "人狼" if target["role"] == "werewolf" else "人間"
+                info.append(f"  Day {entry['day']} 処刑: {entry['target']} → {result_jp}")
+
     elif role == "madman":
         info.append("  ※ 人狼が誰かは分かりません。勘と推理で人狼陣営を勝利に導いてください。")
 

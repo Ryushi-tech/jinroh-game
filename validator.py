@@ -38,6 +38,12 @@ def extract_speakers(text, player_names):
     return speakers
 
 
+ROLE_LABELS = [
+    "人狼", "狂人", "占い師", "霊媒師", "狩人", "村人",
+    "werewolf", "madman", "seer", "medium", "bodyguard", "villager",
+]
+
+
 def validate(game_state, narration_text):
     errors = []
     players = game_state["players"]
@@ -60,6 +66,15 @@ def validate(game_state, narration_text):
         matched = any(candidate.endswith(name) for name in player_names)
         if not matched and candidate:
             errors.append(f"[存在不明] {candidate} は players に登録されていません")
+
+    # 役職付記チェック: 名前（役職）パターンの検出
+    for name in player_names:
+        for role in ROLE_LABELS:
+            pattern = re.escape(name) + r"[（(]" + re.escape(role) + r"[）)]"
+            if re.search(pattern, narration_text):
+                errors.append(
+                    f"[役職漏洩] {name}（{role}）のように役職が付記されています"
+                )
 
     return errors
 
