@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git describe:*)",
+      "Bash(git ls-tree:*)",
+      "Bash(python3:*)"
+    ]
+  }
+}

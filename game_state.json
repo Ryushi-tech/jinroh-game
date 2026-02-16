@@ -1,0 +1,52 @@
+{
+  "day": 1,
+  "phase": "day_discussion",
+  "players": [
+    {
+      "name": "ニコラス",
+      "role": "werewolf",
+      "alive": true
+    },
+    {
+      "name": "アルビン",
+      "role": "madman",
+      "alive": true
+    },
+    {
+      "name": "ディータ",
+      "role": "villager",
+      "alive": true
+    },
+    {
+      "name": "トーマス",
+      "role": "villager",
+      "alive": true
+    },
+    {
+      "name": "モーリッツ",
+      "role": "seer",
+      "alive": true
+    },
+    {
+      "name": "オットー",
+      "role": "werewolf",
+      "alive": true
+    },
+    {
+      "name": "ヤコブ",
+      "role": "villager",
+      "alive": true
+    },
+    {
+      "name": "シモン",
+      "role": "bodyguard",
+      "alive": true
+    },
+    {
+      "name": "ジムゾン",
+      "role": "villager",
+      "alive": true
+    }
+  ],
+  "log": []
+}
