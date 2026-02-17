@@ -43,28 +43,18 @@ def get_player(state, name):
 
 def public_death_info(state):
     """公開情報: 処刑・襲撃による死亡者リスト。
-    処刑者は霊媒結果（人狼/人間）のみ公開。具体的な役職は非公開。
-    襲撃死者は役職非公開（人狼に喰われた＝人狼ではないことだけ確定）。
+    処刑者: 霊媒結果は霊媒師のCOによってのみ公開されるため、陣営は非表示。
+    襲撃死者: 人狼に喰われた＝人狼ではないことだけ確定。
     """
     deaths = []
     for entry in state["log"]:
         if entry["type"] == "execute":
-            # 霊媒結果: 人狼 or 人間 のみ
-            alignment = entry.get("alignment")
-            if alignment:
-                label = "人狼" if alignment == "werewolf" else "人間"
-            else:
-                # 旧ログ互換: alignment がない場合は role から推定
-                target = get_player(state, entry["target"])
-                label = "人狼" if target["role"] == "werewolf" else "人間"
             deaths.append({
                 "name": entry["target"],
                 "day": entry["day"],
                 "cause": "処刑",
-                "role": label,
             })
         elif entry["type"] == "attack" and entry.get("result") == "killed":
-            # 襲撃死者: 人狼ではないことだけ確定
             deaths.append({
                 "name": entry["target"],
                 "day": entry["day"] + 1,  # 翌朝に判明

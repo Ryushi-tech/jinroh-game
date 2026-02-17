@@ -36,6 +36,7 @@ python3 validator.py <描写ファイル>
 ### 2-2. 状態変更の手続き
 - プレイヤーの **死亡・役職変更・フェーズ遷移** は、必ず `logic_engine.py` を介して行うこと。
 - `game_state.json` を **手動で直接編集してはならない**。
+- **夜フェーズの実行は出力を完全に抑制すること**: `logic_engine.py night` の実行時は `> /dev/null 2>&1` で出力を隠す。引数（占い先・護衛先・襲撃先）もユーザーに見えてはならないため、Bash の `description` にも秘密情報を含めないこと。
 
 ### 2-3. 死人は喋らない
 `alive: false` のキャラクターに発言させることは、いかなる場合も禁止。
@@ -127,8 +128,12 @@ night → day_discussion → day_vote → night → ...
 1. game_state.json の現在状態を確認する
 2. characters.json から該当キャラの設定を読む
 3. docs/game_rules.md のルール4（情報秘匿）を確認する
-4. 描写テキストを生成し、一時ファイルに書き出す
-5. python3 validator.py <一時ファイル> を実行する
+4. 描写テキストを生成し、scene_dayN_xxx.txt に書き出す
+   ファイル名規則: scene_day{日数}_{フェーズ名}.txt
+   例: scene_day1_morning.txt, scene_day1_disc1.txt, scene_day1_vote.txt
+   同フェーズで複数ファイルがある場合は連番: disc1, disc2, disc3...
+   ※ Bash で書き込み、出力を抑制する（内容の二重表示を防ぐ）
+5. python3 validator.py <sceneファイル> を実行する
 6. 成功 → ユーザーに提示する
    失敗 → 修正して手順5に戻る
 ```

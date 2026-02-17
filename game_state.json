@@ -1,52 +1,158 @@
 {
-  "day": 1,
-  "phase": "day_discussion",
+  "day": 3,
+  "phase": "night",
   "players": [
-    {
-      "name": "ヴァルター",
-      "role": "werewolf",
-      "alive": true
-    },
     {
       "name": "オットー",
       "role": "villager",
       "alive": true
     },
     {
-      "name": "ディータ",
-      "role": "bodyguard",
-      "alive": true
+      "name": "パメラ",
+      "role": "werewolf",
+      "alive": false
     },
     {
-      "name": "アルビン",
-      "role": "medium",
-      "alive": true
-    },
-    {
-      "name": "モーリッツ",
-      "role": "villager",
-      "alive": true
-    },
-    {
-      "name": "ヤコブ",
-      "role": "villager",
-      "alive": true
-    },
-    {
-      "name": "シモン",
+      "name": "リーザ",
       "role": "madman",
       "alive": true
     },
     {
-      "name": "フリーデル",
-      "role": "werewolf",
+      "name": "レジーナ",
+      "role": "seer",
+      "alive": false
+    },
+    {
+      "name": "アルビン",
+      "role": "villager",
       "alive": true
     },
     {
       "name": "ニコラス",
-      "role": "seer",
+      "role": "villager",
+      "alive": false
+    },
+    {
+      "name": "カタリナ",
+      "role": "bodyguard",
       "alive": true
+    },
+    {
+      "name": "ヨアヒム",
+      "role": "werewolf",
+      "alive": false
+    },
+    {
+      "name": "モーリッツ",
+      "role": "medium",
+      "alive": false
     }
   ],
-  "log": []
+  "log": [
+    {
+      "day": 1,
+      "phase": "day_vote",
+      "type": "execute",
+      "target": "モーリッツ",
+      "alignment": "human",
+      "tally": {
+        "モーリッツ": 7,
+        "オットー": 1,
+        "レジーナ": 1
+      },
+      "votes": {
+        "オットー": "モーリッツ",
+        "モーリッツ": "オットー",
+        "ヨアヒム": "モーリッツ",
+        "カタリナ": "モーリッツ",
+        "レジーナ": "モーリッツ",
+        "ニコラス": "モーリッツ",
+        "リーザ": "モーリッツ",
+        "アルビン": "モーリッツ",
+        "パメラ": "レジーナ"
+      }
+    },
+    {
+      "day": 1,
+      "phase": "night",
+      "type": "seer",
+      "actor": "レジーナ",
+      "target": "ヨアヒム",
+      "result": "werewolf"
+    },
+    {
+      "day": 1,
+      "phase": "night",
+      "type": "guard",
+      "actor": "カタリナ",
+      "target": "レジーナ"
+    },
+    {
+      "day": 1,
+      "phase": "night",
+      "type": "attack",
+      "target": "ニコラス",
+      "result": "killed"
+    },
+    {
+      "day": 2,
+      "phase": "day_vote",
+      "type": "execute",
+      "target": "ヨアヒム",
+      "alignment": "werewolf",
+      "tally": {
+        "ヨアヒム": 6,
+        "レジーナ": 1
+      },
+      "votes": {
+        "オットー": "ヨアヒム",
+        "レジーナ": "ヨアヒム",
+        "カタリナ": "ヨアヒム",
+        "アルビン": "ヨアヒム",
+        "リーザ": "ヨアヒム",
+        "パメラ": "ヨアヒム",
+        "ヨアヒム": "レジーナ"
+      }
+    },
+    {
+      "day": 2,
+      "phase": "night",
+      "type": "seer",
+      "actor": "レジーナ",
+      "target": "パメラ",
+      "result": "werewolf"
+    },
+    {
+      "day": 2,
+      "phase": "night",
+      "type": "guard",
+      "actor": "カタリナ",
+      "target": "オットー"
+    },
+    {
+      "day": 2,
+      "phase": "night",
+      "type": "attack",
+      "target": "レジーナ",
+      "result": "killed"
+    },
+    {
+      "day": 3,
+      "phase": "day_vote",
+      "type": "execute",
+      "target": "パメラ",
+      "alignment": "werewolf",
+      "tally": {
+        "パメラ": 3,
+        "アルビン": 2
+      },
+      "votes": {
+        "オットー": "パメラ",
+        "アルビン": "パメラ",
+        "カタリナ": "パメラ",
+        "リーザ": "アルビン",
+        "パメラ": "アルビン"
+      }
+    }
+  ]
 }

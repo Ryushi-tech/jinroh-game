@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>人狼ビューア</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header id="header">
+    <div class="header-left">
+      <span id="day-phase">--</span>
+    </div>
+    <div class="header-right">
+      <span id="live-indicator" class="live-dot"></span>
+      <span class="live-label">LIVE</span>
+    </div>
+  </header>
+
+  <div id="app">
+    <aside id="sidebar">
+      <section id="player-section" class="sidebar-section">
+        <h2>あなた</h2>
+        <div id="player-info">--</div>
+      </section>
+
+      <section id="alive-section" class="sidebar-section">
+        <h2 id="alive-header">生存者</h2>
+        <ul id="alive-list"></ul>
+      </section>
+
+      <section id="dead-section" class="sidebar-section">
+        <h2 id="dead-header">死亡者</h2>
+        <ul id="dead-list"></ul>
+      </section>
+
+      <section id="private-section" class="sidebar-section">
+        <h2>秘密情報</h2>
+        <ul id="private-list"></ul>
+      </section>
+    </aside>
+
+    <main id="main">
+      <div id="scenes"></div>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

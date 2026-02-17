@@ -1,0 +1,411 @@
+/* ========================================
+   人狼ビューア — ダークテーマ（夜の村落）
+   ======================================== */
+
+:root {
+  --bg-deep: #0d0f14;
+  --bg-main: #141820;
+  --bg-sidebar: #111419;
+  --bg-card: #1a1e28;
+  --bg-header: #10131a;
+  --border: #2a2f3d;
+  --text: #d4d0c8;
+  --text-dim: #8a8678;
+  --text-bright: #ede8d8;
+  --accent: #c9a84c;
+  --accent-dim: #8a7435;
+  --alive: #6a9f5b;
+  --dead: #8b4f4f;
+  --narration: #9a9486;
+  --separator: #c9a84c;
+  --scrollbar-track: #1a1e28;
+  --scrollbar-thumb: #2a2f3d;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: "Hiragino Mincho ProN", "Yu Mincho", "Noto Serif JP", serif;
+  background: var(--bg-deep);
+  color: var(--text);
+  line-height: 1.8;
+  font-size: 15px;
+}
+
+/* ── Header ── */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 48px;
+  padding: 0 24px;
+  background: var(--bg-header);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.header-left {
+  font-size: 18px;
+  font-weight: bold;
+  color: var(--text-bright);
+  letter-spacing: 0.05em;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.live-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--alive);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.live-dot.disconnected {
+  background: var(--dead);
+  animation: none;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+/* ── Layout ── */
+#app {
+  display: flex;
+  height: calc(100vh - 48px);
+}
+
+/* ── Sidebar ── */
+#sidebar {
+  width: 280px;
+  min-width: 280px;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.sidebar-section {
+  background: var(--bg-card);
+  border-radius: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+}
+
+.sidebar-section h2 {
+  font-size: 12px;
+  color: var(--accent);
+  letter-spacing: 0.15em;
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+#player-info {
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+#player-info .player-name {
+  font-size: 17px;
+  font-weight: bold;
+  color: var(--text-bright);
+}
+
+#player-info .player-role {
+  color: var(--accent);
+  font-size: 13px;
+}
+
+#player-info .player-dead {
+  color: var(--dead);
+  font-size: 13px;
+  font-weight: bold;
+}
+
+/* ── Lists ── */
+.sidebar-section ul {
+  list-style: none;
+}
+
+.sidebar-section li {
+  padding: 3px 0;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sidebar-section li .dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dot-alive { background: var(--alive); }
+.dot-dead { background: var(--dead); }
+
+.death-cause {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+#private-list li {
+  font-size: 13px;
+  color: var(--accent);
+  line-height: 1.5;
+  padding: 2px 0;
+}
+
+.no-info {
+  font-size: 13px;
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+/* ── Main (scenes) ── */
+#main {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px 32px;
+  background: var(--bg-main);
+}
+
+#scenes {
+  max-width: 720px;
+  margin: 0 auto;
+}
+
+/* ── Scene blocks ── */
+.scene-block {
+  margin-bottom: 32px;
+  animation: fadeIn 0.4s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* セリフ */
+.line-speech {
+  margin-bottom: 12px;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.speech-avatar-col {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 52px;
+}
+
+.speech-avatar {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  overflow: hidden;
+  border: 2px solid var(--border);
+  background: var(--bg-card);
+  flex-shrink: 0;
+}
+
+.speech-avatar img {
+  display: block;
+  width: 200%;
+  height: 100%;
+  object-fit: cover;
+  object-position: 25% center;
+}
+
+.speech-name {
+  font-size: 11px;
+  font-weight: bold;
+  flex-shrink: 0;
+  text-align: center;
+  line-height: 1.3;
+  margin-top: 2px;
+  max-width: 52px;
+  word-break: keep-all;
+}
+
+.speech-bubble {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 2px 8px 8px 8px;
+  padding: 8px 14px;
+  line-height: 1.8;
+  flex: 1;
+  position: relative;
+}
+
+/* ナレーション */
+.line-narration {
+  margin-bottom: 10px;
+  color: var(--narration);
+  font-style: italic;
+  font-size: 14px;
+  padding-left: 62px;
+  line-height: 1.8;
+}
+
+/* シーン区切り */
+.line-separator {
+  text-align: center;
+  color: var(--separator);
+  margin: 28px 0;
+  font-size: 14px;
+  letter-spacing: 0.3em;
+  position: relative;
+}
+
+.line-separator::before,
+.line-separator::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  width: 60px;
+  height: 1px;
+  background: linear-gradient(to var(--dir), var(--separator), transparent);
+}
+
+.line-separator::before {
+  --dir: left;
+  right: calc(50% + 8em);
+}
+
+.line-separator::after {
+  --dir: right;
+  left: calc(50% + 8em);
+}
+
+/* ── Tooltip (character description) ── */
+.speech-name[title] {
+  cursor: help;
+}
+
+/* ── Role icon badge ── */
+.role-icon {
+  display: inline-block;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  overflow: hidden;
+  vertical-align: middle;
+  margin-right: 4px;
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.role-icon img {
+  display: block;
+  width: 200%;
+  height: 100%;
+}
+
+.role-icon-right img {
+  margin-left: -100%;
+}
+
+#player-info .role-icon {
+  width: 38px;
+  height: 38px;
+}
+
+/* ── Scrollbar ── */
+#main::-webkit-scrollbar,
+#sidebar::-webkit-scrollbar {
+  width: 6px;
+}
+
+#main::-webkit-scrollbar-track,
+#sidebar::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+}
+
+#main::-webkit-scrollbar-thumb,
+#sidebar::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 3px;
+}
+
+#main::-webkit-scrollbar-thumb:hover,
+#sidebar::-webkit-scrollbar-thumb:hover {
+  background: #3a3f4d;
+}
+
+/* ── Responsive (< 768px) ── */
+@media (max-width: 768px) {
+  #app {
+    flex-direction: column;
+  }
+
+  #sidebar {
+    width: 100%;
+    min-width: unset;
+    max-height: 35vh;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px;
+  }
+
+  .sidebar-section {
+    flex: 1 1 45%;
+    min-width: 140px;
+  }
+
+  #main {
+    padding: 16px;
+  }
+
+  .line-narration {
+    padding-left: 0;
+  }
+
+  .speech-avatar {
+    width: 36px;
+    height: 36px;
+  }
+
+  .speech-avatar-col {
+    width: 42px;
+  }
+
+  .speech-name {
+    font-size: 10px;
+    max-width: 42px;
+  }
+}
