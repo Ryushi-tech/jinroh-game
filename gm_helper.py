@@ -351,6 +351,8 @@ def cmd_discussion_brief(_args):
     print(f"CONFIRMED_WHITE={','.join(confirmed_white) or 'none'}")
     print(f"CONFIRMED_BLACK={','.join(confirmed_black) or 'none'}")
     print(f"COUNTER_CO={','.join(counter_co) or 'none'}")
+    if counter_co:
+        print(f"CO_ORDER={random.choice(['counter_first', 'real_first'])}")
     ranked = sorted(scores.items(), key=lambda x: -x[1])
     print(f"SUSPICION={','.join(f'{n}:{s}' for n, s in ranked) or 'none'}")
     print(f"VOTE_PLAN={vote_plan}")

@@ -113,6 +113,7 @@ python3 gm_helper.py discussion_brief
 | `CONFIRMED_WHITE` | 確定白（占い/霊媒/襲撃死から算出） | 描写で確定白として扱う |
 | `CONFIRMED_BLACK` | 確定黒 | 吊り最優先として描写する |
 | `COUNTER_CO` | 偽占い師COすべきNPC名（複数可） | `disc1` で必ず偽COさせる。`none` なら対抗なし |
+| `CO_ORDER` | `counter_first` / `real_first`（COUNTER_CO≠noneのときのみ出力） | この順番通りにdiscシーンのCOを組む |
 | `SUSPICION` | 怪しさスコア降順 | NPCの疑いの方向性の参考にする |
 | `VOTE_PLAN` | NPC多数派の投票先予測 | 投票シーンの参考にする |
 | `WOLF_ALIVE` / `VILLAGE_ALIVE` | 生存数 | 盤面整理に使用 |
