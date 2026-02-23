@@ -44,7 +44,7 @@ ROLE_LABELS = [
 ]
 
 
-def validate(game_state, narration_text, is_epilogue=False):
+def validate(game_state, narration_text, is_epilogue=False, executed_name=None):
     errors = []
     players = game_state["players"]
     player_names = [p["name"] for p in players]
@@ -52,10 +52,10 @@ def validate(game_state, narration_text, is_epilogue=False):
 
     speakers = extract_speakers(narration_text, player_names)
 
-    # 死人発言チェック（epilogueは除外）
+    # 死人発言チェック（epilogueは除外、処刑シーンは処刑対象の最後の言葉を許可）
     if not is_epilogue:
         for name in speakers:
-            if name in dead_names:
+            if name in dead_names and name != executed_name:
                 errors.append(f"[死人発言] {name} は死亡済みですが発言しています")
 
     # 存在チェック: 「」の直前にある名前がplayersに存在するか
@@ -91,7 +91,15 @@ def main():
     narration_text = load_narration(narration_path)
     is_epilogue = "epilogue" in narration_path
 
-    errors = validate(game_state, narration_text, is_epilogue=is_epilogue)
+    # 処刑シーン: 直近の処刑対象の最後の言葉を許可
+    executed_name = None
+    if "_execution" in narration_path and not is_epilogue:
+        for e in reversed(game_state["log"]):
+            if e["type"] == "execute":
+                executed_name = e["target"]
+                break
+
+    errors = validate(game_state, narration_text, is_epilogue=is_epilogue, executed_name=executed_name)
 
     if errors:
         print("=== バリデーション失敗 ===")
