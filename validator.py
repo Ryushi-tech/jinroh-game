@@ -44,7 +44,7 @@ ROLE_LABELS = [
 ]
 
 
-def validate(game_state, narration_text):
+def validate(game_state, narration_text, is_epilogue=False):
     errors = []
     players = game_state["players"]
     player_names = [p["name"] for p in players]
@@ -52,10 +52,11 @@ def validate(game_state, narration_text):
 
     speakers = extract_speakers(narration_text, player_names)
 
-    # 死人発言チェック
-    for name in speakers:
-        if name in dead_names:
-            errors.append(f"[死人発言] {name} は死亡済みですが発言しています")
+    # 死人発言チェック（epilogueは除外）
+    if not is_epilogue:
+        for name in speakers:
+            if name in dead_names:
+                errors.append(f"[死人発言] {name} は死亡済みですが発言しています")
 
     # 存在チェック: 「」の直前にある名前がplayersに存在するか
     # player_names に含まれない名前が発言していないか検出する
@@ -67,14 +68,15 @@ def validate(game_state, narration_text):
         if not matched and candidate:
             errors.append(f"[存在不明] {candidate} は players に登録されていません")
 
-    # 役職付記チェック: 名前（役職）パターンの検出
-    for name in player_names:
-        for role in ROLE_LABELS:
-            pattern = re.escape(name) + r"[（(]" + re.escape(role) + r"[）)]"
-            if re.search(pattern, narration_text):
-                errors.append(
-                    f"[役職漏洩] {name}（{role}）のように役職が付記されています"
-                )
+    # 役職付記チェック: 名前（役職）パターンの検出（epilogueは除外）
+    if not is_epilogue:
+        for name in player_names:
+            for role in ROLE_LABELS:
+                pattern = re.escape(name) + r"[（(]" + re.escape(role) + r"[）)]"
+                if re.search(pattern, narration_text):
+                    errors.append(
+                        f"[役職漏洩] {name}（{role}）のように役職が付記されています"
+                    )
 
     return errors
 
@@ -87,8 +89,9 @@ def main():
     narration_path = sys.argv[1]
     game_state = load_game_state()
     narration_text = load_narration(narration_path)
+    is_epilogue = "epilogue" in narration_path
 
-    errors = validate(game_state, narration_text)
+    errors = validate(game_state, narration_text, is_epilogue=is_epilogue)
 
     if errors:
         print("=== バリデーション失敗 ===")
