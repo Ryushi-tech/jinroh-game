@@ -236,10 +236,11 @@ python3 gm_helper.py night_actions
 1. scene_epilogue.txt を生成（全役職公開・勝敗発表）
 2. python3 validator.py scene_epilogue.txt
 3. scene_epilogue_thread.txt を生成（感想戦・BBS風）
-   - 全キャラが役職公開の上で振り返る
+   - 全キャラが役職公開の上で振り返る（死亡者も含む全員が発言してよい）
    - characters.json の口調を維持すること
    - 「名前「セリフ」」形式で記述（ビューアのパーサー互換）
    - 情報秘匿ルールはゲーム終了後のため適用外
+   - validator は `scene_epilogue*.txt` に対して死人発言・役職漏洩チェックを自動スキップする
 4. python3 validator.py scene_epilogue_thread.txt
 ```
 
