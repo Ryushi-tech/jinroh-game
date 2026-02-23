@@ -385,7 +385,11 @@ def cmd_night_actions(args):
             cands = [p["name"] for p in alive
                      if p["name"] != seer_p["name"] and p["name"] not in already]
             if cands:
-                seer_target = random.choice(cands)
+                npc_seer_target = notes.get("npc_seer_target")
+                if npc_seer_target and npc_seer_target in cands:
+                    seer_target = npc_seer_target
+                else:
+                    seer_target = random.choice(cands)
 
     # --- 狩人 ---
     guard_target = None
@@ -398,14 +402,18 @@ def cmd_night_actions(args):
             prev  = last_guard_target(state)
             cands = [p["name"] for p in alive
                      if p["name"] != guard_p["name"] and p["name"] != prev]
-            seer_co = next(
-                (e["actor"] for e in state["log"] if e["type"] == "seer"), None
-            )
-            alive_names = [p["name"] for p in alive]
-            if seer_co and seer_co in alive_names and seer_co != prev:
-                guard_target = seer_co
-            elif cands:
-                guard_target = random.choice(cands)
+            npc_guard_target = notes.get("npc_guard_target")
+            if npc_guard_target and npc_guard_target in cands:
+                guard_target = npc_guard_target
+            else:
+                seer_co = next(
+                    (e["actor"] for e in state["log"] if e["type"] == "seer"), None
+                )
+                alive_names = [p["name"] for p in alive]
+                if seer_co and seer_co in alive_names and seer_co != prev:
+                    guard_target = seer_co
+                elif cands:
+                    guard_target = random.choice(cands)
 
     # --- 人狼 ---
     attack_target = None

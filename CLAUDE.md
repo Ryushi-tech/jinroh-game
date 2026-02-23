@@ -190,6 +190,25 @@ vote scene 生成前に `.gm_notes.json` の `village_vote_target` を議論の�
 
 ### 4-5. 夜フェーズ
 
+**npc_seer_target / npc_guard_target の更新ルール（night_actions 呼び出し前）:**
+
+NPC占い師・NPC狩人が生存しており、かつプレイヤーがその役職でない場合、
+議論で合意された行動先を `.gm_notes.json` に記録してから `night_actions` を呼ぶこと。
+
+```json
+{
+  "npc_seer_target": "アルビン",
+  "npc_guard_target": "ディータ"
+}
+```
+
+| キー | 使われ方 | フォールバック |
+|---|---|---|
+| `npc_seer_target` | NPC占い師の占い先（未占いリストにある場合のみ採用） | ランダム |
+| `npc_guard_target` | NPC狩人の護衛先（前夜と異なる場合のみ採用） | 占い師CO→ランダム |
+
+- 議論で明確に合意されなかった場合は更新不要（フォールバックが動く）
+
 ```bash
 # プレイヤーが占い師（占い先をユーザーから聞いてから実行）
 python3 gm_helper.py night_actions --seer <占い先>
