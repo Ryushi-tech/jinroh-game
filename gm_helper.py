@@ -216,6 +216,49 @@ def _suspicion_scores(state, alive, confirmed_white, confirmed_black, player):
     return scores
 
 
+def _decide_attack_target(state, alive, seer_target, notes):
+    """
+    人狼の襲撃先決定ロジック（優先順位順）:
+    1. 今夜 seer_target が人狼 → 占い師を狙う（護衛ギャンブル）
+    2. 直前の処刑が人狼      → 霊媒師を狙う（護衛ギャンブル）
+    3. それ以外              → wolf_accusations の疑惑者を優先、なければランダム
+    """
+    wolf_names = {p["name"] for p in state["players"] if p["role"] == "werewolf"}
+    non_wolves = [p["name"] for p in alive if p["role"] != "werewolf"]
+    if not non_wolves:
+        return None
+
+    # Case 1: 今夜の占い先が人狼 → 占い師を狙う
+    if seer_target and seer_target in wolf_names:
+        seer = next((p["name"] for p in alive if p["role"] == "seer"), None)
+        if seer and seer in non_wolves:
+            return seer
+
+    # Case 2: 直前の処刑が人狼 → 霊媒師を狙う
+    last_exec = next((e for e in reversed(state["log"]) if e["type"] == "execute"), None)
+    if last_exec and last_exec.get("alignment") == "werewolf":
+        medium = next((p["name"] for p in alive if p["role"] == "medium"), None)
+        if medium and medium in non_wolves:
+            return medium
+
+    # Case 3: wolf_accusations から生存狼への疑惑者を集め、最多の人を狙う
+    accusations = notes.get("wolf_accusations", {})
+    alive_set = {p["name"] for p in alive}
+    suspectors: dict[str, int] = {}
+    for wolf_name, accusers in accusations.items():
+        if wolf_name in wolf_names:  # 生存中の狼への疑惑のみカウント
+            for accuser in accusers:
+                if accuser in alive_set and accuser not in wolf_names:
+                    suspectors[accuser] = suspectors.get(accuser, 0) + 1
+    if suspectors:
+        top_count = max(suspectors.values())
+        top = [name for name, cnt in suspectors.items() if cnt == top_count]
+        return random.choice(top)
+
+    # フォールバック: ランダム
+    return random.choice(non_wolves)
+
+
 def _decide_counter_co(state, notes, player):
     """
     対抗CO判断。
@@ -224,11 +267,6 @@ def _decide_counter_co(state, notes, player):
     - 狂人が出た場合: 各狼が独立に15%で出る
     - 外側ゲート: 1% で全員出ない
     """
-    # 占い師COがまだなければ対抗不要
-    seer_co_actors = {e["actor"] for e in state["log"] if e["type"] == "seer"}
-    if not seer_co_actors:
-        return []
-
     # 3日目以降は手遅れ
     if state["day"] > 2:
         return []
@@ -371,15 +409,7 @@ def cmd_night_actions(args):
         if args.attack: attack_target = args.attack
         else:           need_attack = True
     else:
-        non_wolves = [p["name"] for p in alive if p["role"] != "werewolf"]
-        if non_wolves:
-            seer_co = next(
-                (e["actor"] for e in state["log"] if e["type"] == "seer"), None
-            )
-            attack_target = (
-                seer_co if seer_co and seer_co in non_wolves
-                else random.choice(non_wolves)
-            )
+        attack_target = _decide_attack_target(state, alive, seer_target, notes)
 
     if need_seer or need_guard or need_attack:
         if need_seer:   print("NEED_SEER_INPUT=true")
@@ -441,7 +471,9 @@ def cmd_vote_decide(args):
         run_silent("advance_phase")
         state = load_state()
 
-    votes = {player: args.player_vote}
+    # 死亡プレイヤーは投票できない
+    player_alive = any(p["name"] == player and p["alive"] for p in state["players"])
+    votes = {player: args.player_vote} if player_alive else {}
     seer_co = next((e["actor"] for e in state["log"] if e["type"] == "seer"), None)
 
     for p in alive:

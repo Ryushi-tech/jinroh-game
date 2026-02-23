@@ -130,7 +130,26 @@ python3 gm_helper.py discussion_brief
 5. 描写テキストを生成し、scene_dayN_discX.txt に書き出す
 6. python3 validator.py <sceneファイル> を実行する
 7. 成功 → ユーザーに提示する / 失敗 → 修正して6に戻る
+8. .gm_notes.json の wolf_accusations を更新する（下記参照）
 ```
+
+**wolf_accusations の更新ルール:**
+
+議論シーンを生成・確定するたびに、`.gm_notes.json` の `wolf_accusations` を最新の状態に保つこと。
+
+```json
+{
+  "wolf_accusations": {
+    "トーマス": ["ヤコブ", "シモン"],
+    "パメラ": ["ディータ"]
+  }
+}
+```
+
+- キー: 人狼プレイヤー名（全人狼分を記載）
+- 値: 現在その人狼を疑っている生存者名のリスト（累積ではなく **現在時点** の状態）
+- 疑いが晴れた・話題が変わった場合はリストから除く
+- gm_helper.py の襲撃先決定（夜フェーズ）がこのデータを参照する
 
 ファイル名規則:
 ```
