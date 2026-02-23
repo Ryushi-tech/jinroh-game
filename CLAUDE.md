@@ -164,9 +164,23 @@ scene_day{N}_execution.txt    # 処刑シーン
 ### 4-4. 投票・処刑
 
 ```bash
-# プレイヤーの投票先をユーザーから聞いてから実行
+# 1. 議論の着地点を .gm_notes.json に記録してから実行
+#    （village_vote_target = 村の多数派が向かっている処刑候補）
+# 2. プレイヤーの投票先をユーザーから聞いてから実行
 python3 gm_helper.py vote_decide --player-vote <投票先>
 ```
+
+**village_vote_target の更新ルール:**
+
+vote scene 生成前に `.gm_notes.json` の `village_vote_target` を議論の着地点に更新すること。
+
+```json
+{ "village_vote_target": "ヴァルター" }
+```
+
+- 村人陣営 NPC 全員がこの候補に投票する
+- 狼・狂人は従来通り戦略的投票（seer_co 優先）
+- 翌日の discussion_brief 実行後にリセット不要（上書きで更新）
 
 - `advance_phase` / NPC投票決定 / `logic_engine.py vote` を一括処理
 - 出力: `EXECUTED` / `NPC_VOTES_START...NPC_VOTES_END` / `WIN`

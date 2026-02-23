@@ -441,10 +441,14 @@ def cmd_night_actions(args):
 # vote_decide
 # ---------------------------------------------------------------------------
 
-def _village_vote_candidate(state, alive, me):
+def _village_vote_candidate(state, alive, me, village_vote_target=None):
     cands = [p["name"] for p in alive if p["name"] != me]
     if not cands:
         return None
+    # 議論の着地点が記録されていればそれに従う
+    if village_vote_target and village_vote_target in cands:
+        return village_vote_target
+    # フォールバック: 前回タリーのトップ
     last_tally = None
     for e in reversed(state["log"]):
         if e["type"] == "execute" and "tally" in e:
@@ -471,6 +475,9 @@ def cmd_vote_decide(args):
         run_silent("advance_phase")
         state = load_state()
 
+    notes = load_notes()
+    village_vote_target = notes.get("village_vote_target")
+
     # 死亡プレイヤーは投票できない
     player_alive = any(p["name"] == player and p["alive"] for p in state["players"])
     votes = {player: args.player_vote} if player_alive else {}
@@ -493,7 +500,9 @@ def cmd_vote_decide(args):
                 cands = [x["name"] for x in alive if x["name"] != p["name"]]
             votes[p["name"]] = random.choice(cands) if cands else None
         else:
-            votes[p["name"]] = _village_vote_candidate(state, alive, p["name"])
+            votes[p["name"]] = _village_vote_candidate(
+                state, alive, p["name"], village_vote_target
+            )
 
     votes = {k: v for k, v in votes.items() if v}
 
