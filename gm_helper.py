@@ -166,9 +166,14 @@ def cmd_setup(args):
 
 def _confirmed_info(state):
     """村視点の確定白・確定黒をログから計算する。"""
+    alive_names = {p["name"] for p in state["players"] if p["alive"]}
     black, white = [], []
     for e in state["log"]:
         if e["type"] == "seer":
+            # 占い師が死亡していれば結果を発表できないため除外
+            actor = e.get("actor", "")
+            if actor not in alive_names:
+                continue
             if e["result"] == "werewolf":
                 black.append(e["target"])
             else:
@@ -360,6 +365,7 @@ def cmd_discussion_brief(_args):
 
 def cmd_night_actions(args):
     state  = load_state()
+    notes  = load_notes()
     player = pname()
     alive  = alive_players(state)
 
