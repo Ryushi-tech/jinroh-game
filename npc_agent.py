@@ -432,6 +432,105 @@ def generate_all_npc_messages(
 
 
 # ---------------------------------------------------------------------------
+# 疑惑スコア収集
+# ---------------------------------------------------------------------------
+
+def _build_suspicion_prompt(
+    npc_name: str,
+    player_view: dict,
+    context_discs: str = "",
+) -> str:
+    alive = player_view["alive_players"]
+    others = [n for n in alive if n != npc_name]
+    role_jp = player_view["self"]["role_jp"]
+    context_section = f"\n## 今日の議論\n{context_discs}\n" if context_discs else ""
+    example = json.dumps({n: 5 for n in others[:3]}, ensure_ascii=False)
+
+    return f"""\
+あなたは{npc_name}として人狼ゲームに参加しています。
+
+## 自分の役職
+{role_jp}（あなただけが知っている秘密情報）
+
+## 生存者（自分を除く）
+{chr(10).join(f'  - {n}' for n in others)}
+{context_section}
+## タスク
+今日の議論を踏まえ、各生存者への疑惑度を 1〜10（10が最も怪しい）でJSONで返してください。
+自分自身はリストに含めないこと。他のプレイヤーの役職は分かりません。公開情報だけで判断してください。
+
+出力フォーマット（JSONのみ・コードブロック不要）:
+{example}
+（全員分を出力すること）\
+"""
+
+
+def _collect_one_suspicion(
+    name: str,
+    state: dict,
+    notes: dict,
+    char_map: dict,
+    context_discs: str,
+) -> dict[str, int]:
+    try:
+        player_view = get_player_view(state, name, notes)
+    except ValueError as e:
+        print(f"[npc_agent] suspicion get_player_view failed for {name}: {e}", file=sys.stderr)
+        return {}
+    prompt = _build_suspicion_prompt(name, player_view, context_discs)
+    try:
+        raw = _call_fn(prompt).strip()
+        data = _parse_json_robust(raw, name)
+        return {k: max(1, min(10, int(v))) for k, v in data.items() if isinstance(v, (int, float))}
+    except Exception as e:
+        print(f"[npc_agent] {name} suspicion parse failed: {e}", file=sys.stderr)
+        return {}
+
+
+def collect_all_suspicion_scores(
+    npc_names: list[str],
+    state: dict,
+    notes: dict,
+    chars: list,
+    context_discs: str = "",
+) -> dict[str, float]:
+    """全 NPC の疑惑スコアを並列収集し、プレイヤーごとの平均値を返す。
+
+    Returns: {player_name: avg_score (1.0–10.0)}
+    """
+    if _call_fn is None:
+        return {}
+
+    char_map = {c["name"]: c for c in chars}
+    all_scores: list[dict[str, int]] = []
+
+    with ThreadPoolExecutor(max_workers=min(len(npc_names), 4)) as executor:
+        futures = {
+            executor.submit(_collect_one_suspicion, name, state, notes, char_map, context_discs): name
+            for name in npc_names
+        }
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                scores = future.result()
+            except Exception as e:
+                print(f"[npc_agent] suspicion future failed for {name}: {e}", file=sys.stderr)
+                scores = {}
+            if scores:
+                all_scores.append(scores)
+
+    if not all_scores:
+        return {}
+
+    totals: dict[str, list[int]] = {}
+    for scores in all_scores:
+        for player, score in scores.items():
+            totals.setdefault(player, []).append(score)
+
+    return {player: sum(vals) / len(vals) for player, vals in totals.items()}
+
+
+# ---------------------------------------------------------------------------
 # 思考ログ保存
 # ---------------------------------------------------------------------------
 

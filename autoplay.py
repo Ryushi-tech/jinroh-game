@@ -40,8 +40,8 @@ def parse_kv(text: str) -> dict[str, str]:
 def parse_npc_votes(text: str) -> dict[str, dict]:
     """vote_decide 出力の NPC_VOTES_START...NPC_VOTES_END ブロックを解析する。
 
-    出力フォーマット: voter=target:reason_category
-    戻り値: {voter: {"target": str, "reason": str}}
+    出力フォーマット: voter=target:reason_category:role_hint
+    戻り値: {voter: {"target": str, "reason": str, "role_hint": str}}
     """
     result: dict[str, dict] = {}
     in_block = False
@@ -52,11 +52,13 @@ def parse_npc_votes(text: str) -> dict[str, dict]:
             in_block = False
         elif in_block and "=" in line:
             voter, _, rest = line.partition("=")
-            if ":" in rest:
-                target, _, reason = rest.partition(":")
-            else:
-                target, reason = rest, "consensus"
-            result[voter.strip()] = {"target": target.strip(), "reason": reason.strip()}
+            parts = rest.split(":")
+            target    = parts[0].strip()
+            reason    = parts[1].strip() if len(parts) > 1 else "consensus"
+            role_hint = parts[2].strip() if len(parts) > 2 else "villager"
+            result[voter.strip()] = {
+                "target": target, "reason": reason, "role_hint": role_hint,
+            }
     return result
 
 
@@ -181,6 +183,9 @@ def run_game(game_num: int, verbose: bool = True) -> dict:
             if not out:
                 result["errors"].append(f"Day{day} disc 生成失敗\n{err[:200]}")
                 note(f"disc 失敗")
+
+            # 疑惑スコア収集（議論終了後・vote_decide 前）
+            run(["python3.11", "gemini_gm.py", "suspicion-json"])
 
             # vote_decide を先に実行して実際の投票結果を取得
             vote_out, _ = run([

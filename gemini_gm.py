@@ -693,6 +693,21 @@ _REASON_HINT = {
     "conviction": "自分の判断に基づく投票。根拠を一言添える。",
 }
 
+# role_hint → 内部動機ヒント（LLM がセリフを書く際の演技指導。絶対に台詞には出さない）
+_MOTIVATION_HINT = {
+    "wolf_strategic": (
+        "【内部情報・台詞に絶対に出さないこと】"
+        "このNPCは脅威となる相手を戦略的に排除しようとしている。"
+        "真の意図はセリフに一切出さず、議論の文脈から自然な翻意の言い訳を作ること。"
+    ),
+    "madman_disrupt": (
+        "【内部情報・台詞に絶対に出さないこと】"
+        "このNPCは表面上は村人として振る舞いながら内心では別の意図がある。"
+        "意図はセリフに出さず、自然な村人的言動で投票宣言すること。"
+    ),
+    "villager": "",  # 追加ヒントなし
+}
+
 
 def _load_disc_context(day: int) -> str:
     """当日の disc テキストを結合して返す（vote scene の文脈として使用）。"""
@@ -705,6 +720,34 @@ def _load_disc_context(day: int) -> str:
         except OSError:
             pass
     return "\n\n".join(texts)
+
+
+def cmd_suspicion_json(client, state: dict, chars: list, player: str) -> None:
+    """各 NPC に疑惑スコア（1-10）を付けさせ .gm_notes.json に保存する。
+
+    vote_decide より前に呼ぶことで、議論の結果を投票ロジックに反映させる。
+    """
+    day = state["day"]
+    alive_names = [p["name"] for p in state["players"] if p["alive"]]
+    npc_names   = [n for n in alive_names if n != player]
+
+    context_discs = _load_disc_context(day)
+    notes = load_notes()
+
+    print(f"[suspicion] {len(npc_names)}人分のヘイト値を収集中...", file=sys.stderr)
+    avg_scores = _npc_agent.collect_all_suspicion_scores(
+        npc_names, state, notes, chars, context_discs,
+    )
+
+    if avg_scores:
+        notes["npc_suspicion_avg"] = avg_scores
+        with open(NOTES_FILE, "w", encoding="utf-8") as f:
+            json.dump(notes, f, ensure_ascii=False, indent=2)
+        print(f"SUSPICION_SAVED={len(avg_scores)}")
+        for name, score in sorted(avg_scores.items(), key=lambda x: -x[1]):
+            print(f"  {name}: {score:.1f}")
+    else:
+        print("SUSPICION_SAVED=0", file=sys.stderr)
 
 
 def cmd_vote(client, state: dict, chars: list, player: str, npc_votes: dict | None = None) -> None:
@@ -727,14 +770,18 @@ def cmd_vote(client, state: dict, chars: list, player: str, npc_votes: dict | No
         for voter, info in npc_votes.items():
             if voter == player:
                 continue
-            # info は {"target": ..., "reason": ...} または後方互換で str
             if isinstance(info, dict):
-                target = info.get("target", "")
-                reason = info.get("reason", "consensus")
+                target    = info.get("target", "")
+                reason    = info.get("reason", "consensus")
+                role_hint = info.get("role_hint", "villager")
             else:
-                target, reason = str(info), "consensus"
-            hint = _REASON_HINT.get(reason, _REASON_HINT["consensus"])
-            lines.append(f"- {voter} → {target}（演技指示: {hint}）")
+                target, reason, role_hint = str(info), "consensus", "villager"
+            cover_hint   = _REASON_HINT.get(reason, _REASON_HINT["consensus"])
+            motivation   = _MOTIVATION_HINT.get(role_hint, "")
+            entry = f"- {voter} → {target}\n  演技指示: {cover_hint}"
+            if motivation:
+                entry += f"\n  {motivation}"
+            lines.append(entry)
         vote_instruction = (
             "## 各NPCの投票先と演技指示\n"
             "投票先は決定済み。これまでの議論の流れを踏まえ、不自然にならない台詞を書くこと。\n"
@@ -896,7 +943,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="GM ナラティブ生成エンジン")
     parser.add_argument(
         "scene",
-        choices=["morning", "discussion", "vote", "execution", "epilogue", "epilogue-thread"],
+        choices=["morning", "discussion", "suspicion-json", "vote", "execution", "epilogue", "epilogue-thread"],
         help="生成するシーンタイプ",
     )
     parser.add_argument(
@@ -932,6 +979,7 @@ def main() -> None:
     dispatch = {
         "morning":         cmd_morning,
         "discussion":      cmd_discussion,
+        "suspicion-json":  cmd_suspicion_json,
         "vote":            cmd_vote,
         "execution":       cmd_execution,
         "epilogue":        cmd_epilogue,

@@ -213,6 +213,12 @@ def _suspicion_scores(state, alive, confirmed_white, confirmed_black, player, no
         if name in scores:
             scores[name] -= 3
 
+    # LLM疑惑スコア（npc_suspicion_avg）をブレンド
+    # 5点 = ニュートラル（オフセット 0）、10点 = +5、1点 = −4
+    for name, llm_score in notes.get("npc_suspicion_avg", {}).items():
+        if name in scores:
+            scores[name] += (llm_score - 5)
+
     # 確定黒はスコアリング対象外（吊り一択）
     for name in confirmed_black:
         scores.pop(name, None)
@@ -570,20 +576,28 @@ def cmd_vote_decide(args):
             executed = line.split("決選の結果")[1].strip().split("を処刑")[0].strip()
 
     # reason_category: 村の合意と一致するか否か（役職非依存の判定）
-    # pivot   = 村合意と異なる投票（LLM に「翻意の cover story」を書かせる）
-    # consensus = 村合意と一致（自然な流れで投票）
+    # pivot      = 村合意と異なる投票（LLM に「翻意の cover story」を書かせる）
+    # consensus  = 村合意と一致（自然な流れで投票）
     # conviction = village_vote_target 未設定のため各自の判断
-    def _reason(voter_name: str, target: str) -> str:
+    def _reason(target: str) -> str:
         if not village_vote_target:
             return "conviction"
         return "consensus" if target == village_vote_target else "pivot"
+
+    # role_hint: LLM が cover story を書く際の内部動機ヒント（役職情報・台詞には出さない）
+    _ROLE_HINT_MAP = {
+        "werewolf": "wolf_strategic",
+        "madman":   "madman_disrupt",
+    }
+    alive_role = {p["name"]: p["role"] for p in alive}
 
     state = load_state()
     print(f"EXECUTED={executed or 'unknown'}")
     print("NPC_VOTES_START")
     for voter, target in votes.items():
         if voter != player:
-            print(f"{voter}={target}:{_reason(voter, target)}")
+            role_hint = _ROLE_HINT_MAP.get(alive_role.get(voter, ""), "villager")
+            print(f"{voter}={target}:{_reason(target)}:{role_hint}")
     print("NPC_VOTES_END")
     print(f"WIN={win_status(state)}")
 
