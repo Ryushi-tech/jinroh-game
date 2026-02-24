@@ -1,17 +1,20 @@
 // 人狼ビューア — フロントエンド
-// ポーリング + サイドバー描画 + シーン描画
+// ポーリング + サイドバー描画 + シーン描画 + タイピングインジケータ
 
 (function () {
   "use strict";
 
-  const POLL_INTERVAL = 3000;
+  const POLL_INTERVAL_NORMAL = 3000;
+  const POLL_INTERVAL_TYPING = 1000;  // 生成中は高速ポーリング
+
   let lastHash = null;
   let loadedScenes = new Set();
+  let sceneDivs = {};          // scene name → div element（差分更新用）
   let charDescriptions = {};
   let userScrolledUp = false;
+  let isTyping = false;        // 現在 NPC 生成中かどうか
 
   // ── 役職アイコンマッピング ──
-  // 各画像は左右2枚組。side: "left" = 左半分, "right" = 右半分
   var ROLE_ICON = {
     seer:      { file: "占い師_霊媒師.png", side: "left" },
     medium:    { file: "占い師_霊媒師.png", side: "right" },
@@ -113,7 +116,6 @@
       $deadList.innerHTML = state.deaths.map(function (d) {
         var icon = "";
         if (state.game_over && d.role) {
-          // ゲーム終了後のみ: 具体的な役職アイコン
           icon = roleIconHtml(ROLE_ICON[d.role]);
         }
         var causeLabel = (d.alignment ? esc(d.alignment) + " " : "") + "D" + d.day + esc(d.cause);
@@ -137,10 +139,6 @@
   }
 
   // ── Scene parsing ──
-  // Patterns:
-  //   名前「セリフ」 → speech
-  //   ――で始まる行 → separator
-  //   その他 → narration
   function parseScene(text) {
     var lines = text.split("\n");
     var blocks = [];
@@ -154,7 +152,6 @@
       if (speechMatch) {
         var name = speechMatch[1];
         var content = speechMatch[2];
-        // 閉じ括弧を除去
         if (content.endsWith("」")) {
           content = content.slice(0, -1);
         }
@@ -185,12 +182,14 @@
     for (var i = 0; i < blocks.length; i++) {
       var b = blocks[i];
       if (b.type === "speech") {
-        var color = nameToColor(b.name);
-        var title = charDescriptions[b.name] ? ' title="' + esc(charDescriptions[b.name]) + '"' : "";
+        // 「名前（役職）」形式で生成された場合に備え、括弧部分を除いた基本名でアバター・色を解決する
+        var baseName = b.name.replace(/（[^）]*）$/, "");
+        var color = nameToColor(baseName);
+        var title = charDescriptions[baseName] ? ' title="' + esc(charDescriptions[baseName]) + '"' : "";
         html += '<div class="line-speech">' +
           '<div class="speech-avatar-col"' + title + ">" +
-          avatarHtml(b.name) +
-          '<div class="speech-name" style="color:' + color + '">' + esc(b.name) + "</div>" +
+          avatarHtml(baseName) +
+          '<div class="speech-name" style="color:' + color + '">' + esc(baseName) + "</div>" +
           "</div>" +
           '<div class="speech-bubble">' + esc(b.text) + "</div>" +
           "</div>";
@@ -203,31 +202,73 @@
     return html;
   }
 
-  // ── Scene loading ──
-  function loadScenes(sceneList) {
+  // ── タイピングインジケータ ──
+  function renderTypingIndicator(typingData) {
+    var existing = document.getElementById("typing-indicator");
+
+    if (!typingData || !typingData.npc) {
+      if (existing) existing.remove();
+      return;
+    }
+
+    if (!existing) {
+      existing = document.createElement("div");
+      existing.id = "typing-indicator";
+    }
+    // 常に末尾に移動（appendChild は既存要素を移動する）
+    $scenes.appendChild(existing);
+
+    existing.className = "typing-indicator";
+    var baseName = typingData.npc.replace(/（[^）]*）$/, "");
+    var color = nameToColor(baseName);
+    var imgUrl = "/chara_image/" + encodeURIComponent(baseName) + ".png";
+    existing.innerHTML =
+      '<div class="speech-avatar-col">' +
+        '<div class="speech-avatar"><img src="' + esc(imgUrl) + '" alt="" loading="lazy"></div>' +
+        '<div class="speech-name" style="color:' + color + '">' + esc(baseName) + "</div>" +
+      "</div>" +
+      '<div class="typing-dots"><span></span><span></span><span></span></div>';
+
+    scrollToBottom();
+  }
+
+  // ── Scene loading（差分更新対応）──
+  function loadScenes(sceneList, activeScene) {
+    // 未ロードのシーン ＋ アクティブ（生成中）シーンを再取得対象にする
     var newScenes = sceneList.filter(function (name) {
       return !loadedScenes.has(name);
     });
+    var toRefresh = (activeScene && loadedScenes.has(activeScene)) ? [activeScene] : [];
+    var toFetch = newScenes.slice();
+    toRefresh.forEach(function (n) {
+      if (toFetch.indexOf(n) === -1) toFetch.push(n);
+    });
 
-    if (newScenes.length === 0) return;
+    if (toFetch.length === 0) return Promise.resolve();
 
-    var promises = newScenes.map(function (name) {
+    var promises = toFetch.map(function (name) {
       return fetchJSON("/api/scene/" + encodeURIComponent(name)).then(function (data) {
         return { name: data.name, content: data.content };
       });
     });
 
-    Promise.all(promises).then(function (results) {
+    return Promise.all(promises).then(function (results) {
       results.forEach(function (scene) {
-        if (loadedScenes.has(scene.name)) return;
-        loadedScenes.add(scene.name);
-
         var blocks = parseScene(scene.content);
-        var div = document.createElement("div");
-        div.className = "scene-block";
-        div.dataset.scene = scene.name;
-        div.innerHTML = renderSceneBlocks(blocks);
-        $scenes.appendChild(div);
+        var html = renderSceneBlocks(blocks);
+
+        if (sceneDivs[scene.name]) {
+          // 既存 div を差分更新（生成途中シーンの追記に対応）
+          sceneDivs[scene.name].innerHTML = html;
+        } else {
+          var div = document.createElement("div");
+          div.className = "scene-block";
+          div.dataset.scene = scene.name;
+          div.innerHTML = html;
+          $scenes.appendChild(div);
+          sceneDivs[scene.name] = div;
+        }
+        loadedScenes.add(scene.name);
       });
       scrollToBottom();
     }).catch(function (err) {
@@ -256,7 +297,8 @@
         $liveIndicator.classList.add("disconnected");
       })
       .finally(function () {
-        setTimeout(poll, POLL_INTERVAL);
+        // 生成中は高速ポーリング
+        setTimeout(poll, isTyping ? POLL_INTERVAL_TYPING : POLL_INTERVAL_NORMAL);
       });
   }
 
@@ -264,23 +306,28 @@
     return Promise.all([
       fetchJSON("/api/state"),
       fetchJSON("/api/scenes"),
+      fetchJSON("/api/typing").catch(function () { return null; }),
     ]).then(function (results) {
+      var typingData = results[2];
+      isTyping = !!(typingData && typingData.npc);
+      var activeScene = isTyping ? typingData.scene : null;
+
       renderSidebar(results[0]);
-      loadScenes(results[1]);
+      // シーン更新が完了してからタイピングインジケータを末尾に表示
+      return loadScenes(results[1], activeScene).then(function () {
+        renderTypingIndicator(typingData);
+      });
     });
   }
 
   // ── Init ──
   function init() {
-    // Load character descriptions first, then start polling
     fetchJSON("/api/characters")
       .then(function (data) { charDescriptions = data; })
       .catch(function () { /* ok */ })
       .finally(function () {
-        // Initial load
         update().catch(function () {});
-        // Start polling
-        setTimeout(poll, POLL_INTERVAL);
+        setTimeout(poll, POLL_INTERVAL_NORMAL);
       });
   }
 
