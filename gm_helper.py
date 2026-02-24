@@ -276,6 +276,10 @@ def _decide_counter_co(state, notes, player):
     if state["day"] > 2:
         return []
 
+    # 同じ日に既に決定済みなら再実行しない（disc 生成ごとに呼ばれても1日1回のみ動く）
+    if notes.get("counter_co_decided_day") == state["day"]:
+        return []
+
     already_co = set(notes.get("counter_co_actors", []))
 
     madman = find_role(state, "madman")
@@ -332,7 +336,10 @@ def cmd_discussion_brief(_args):
     if counter_co:
         existing = set(notes.get("counter_co_actors", []))
         notes["counter_co_actors"] = list(existing | set(counter_co))
-        save_notes(notes)
+    # 同日の再実行を防ぐため、決定済みフラグを保存（counter_co が空でも記録）
+    if notes.get("counter_co_decided_day") != state["day"]:
+        notes["counter_co_decided_day"] = state["day"]
+    save_notes(notes)
 
     # 4. 投票先予測（確定黒優先 → スコア上位）
     if confirmed_black:

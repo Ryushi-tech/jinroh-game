@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""Gemini GM: Gemini API を使ったナラティブ生成エンジン
+"""GM ナラティブ生成エンジン（Gemini / Claude 切り替え対応）
 
 Usage:
-    python3 gemini_gm.py morning           # 朝・夜明けシーン
-    python3 gemini_gm.py discussion        # 議論シーン（連番自動）
-    python3 gemini_gm.py vote              # 投票宣言シーン
-    python3 gemini_gm.py execution         # 処刑シーン
-    python3 gemini_gm.py epilogue          # エピローグ（全役職公開）
-    python3 gemini_gm.py epilogue-thread   # 感想戦（BBS風）
+    python3 gemini_gm.py morning                        # Gemini（デフォルト）
+    python3 gemini_gm.py morning --backend claude       # Claude に切り替え
+    python3 gemini_gm.py discussion --context "..."
 
 環境変数:
-    GEMINI_API_KEY  Gemini API キー（必須）。.env ファイルも参照する。
+    GEMINI_API_KEY    Gemini API キー
+    ANTHROPIC_API_KEY Claude API キー
 """
 
 from __future__ import annotations
@@ -23,12 +21,19 @@ import subprocess
 import sys
 from pathlib import Path
 
-STATE_FILE  = "game_state.json"
-CHAR_FILE   = "characters.json"
-PLAYER_FILE = ".player_name"
-NOTES_FILE  = ".gm_notes.json"
-MODEL_NAME  = "gemini-2.5-pro"
-MAX_RETRIES = 3
+STATE_FILE        = "game_state.json"
+CHAR_FILE         = "characters.json"
+PLAYER_FILE       = ".player_name"
+NOTES_FILE        = ".gm_notes.json"
+MODEL_NAME        = "gemini-2.5-pro"
+CLAUDE_MODEL_NAME = "claude-haiku-4-5-20251001"
+MAX_RETRIES       = 3
+
+# ---------------------------------------------------------------------------
+# バックエンド切り替え用グローバル
+# ---------------------------------------------------------------------------
+_call_fn   = None   # call_gemini or call_claude（main で設定）
+_token_log: dict[str, int] = {"input": 0, "output": 0}
 
 ROLE_JP = {
     "villager": "村人", "werewolf": "人狼", "seer": "占い師",
@@ -56,7 +61,7 @@ _load_dotenv()
 
 
 # ---------------------------------------------------------------------------
-# Gemini クライアント初期化
+# クライアント初期化
 # ---------------------------------------------------------------------------
 
 def init_gemini():
@@ -70,11 +75,25 @@ def init_gemini():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         print("ERROR: 環境変数 GEMINI_API_KEY が設定されていません。", file=sys.stderr)
-        print("  .env ファイルに GEMINI_API_KEY=... を記述するか、", file=sys.stderr)
-        print("  export GEMINI_API_KEY=... を実行してください。", file=sys.stderr)
         sys.exit(1)
 
     return genai.Client(api_key=api_key)
+
+
+def init_claude():
+    try:
+        import anthropic
+    except ImportError:
+        print("ERROR: anthropic が未インストールです。", file=sys.stderr)
+        print("  python3.11 -m pip install anthropic", file=sys.stderr)
+        sys.exit(1)
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("ERROR: 環境変数 ANTHROPIC_API_KEY が設定されていません。", file=sys.stderr)
+        sys.exit(1)
+
+    return anthropic.Anthropic(api_key=api_key)
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +150,7 @@ def run_discussion_brief() -> dict:
 def build_state_summary(state: dict, player: str) -> str:
     alive = [p for p in state["players"] if p["alive"]]
     dead  = [p for p in state["players"] if not p["alive"]]
+    notes = load_notes()
 
     lines = [
         f"## ゲーム状態",
@@ -145,6 +165,24 @@ def build_state_summary(state: dict, player: str) -> str:
         for p in dead:
             lines.append(f"  - {p['name']}（{_death_cause(state, p['name'])}）")
 
+    # 公開済みCO一覧（.gm_notes.json の public_co_claims から）
+    co_claims = notes.get("public_co_claims", {})
+    if co_claims:
+        role_jp_map = {"seer": "占い師", "medium": "霊媒師", "bodyguard": "狩人"}
+        by_role: dict[str, list[str]] = {}
+        for name, info in co_claims.items():
+            if isinstance(info, dict):
+                role = info.get("role", "")
+                day  = info.get("day", "?")
+            else:
+                role = str(info)
+                day  = "?"
+            role_jp = role_jp_map.get(role, role)
+            by_role.setdefault(role_jp, []).append(f"{name}（Day{day}）")
+        lines += ["", "### 公開済みCO一覧（重要: 再COさせないこと）"]
+        for role_jp, names in by_role.items():
+            lines.append(f"  - {role_jp}CO済み: {'、'.join(names)}")
+
     # 公開済み占い結果（生存占い師のみ）
     alive_names = {p["name"] for p in alive}
     seer_logs = [
@@ -156,6 +194,14 @@ def build_state_summary(state: dict, player: str) -> str:
         for e in seer_logs:
             result_jp = "人狼" if e["result"] == "werewolf" else "白（人間）"
             lines.append(f"  - Day{e['day']}夜: {e['actor']} → {e['target']}: {result_jp}")
+
+    # 公開済み霊媒結果（.gm_notes.json の public_medium_results から）
+    medium_results = notes.get("public_medium_results", [])
+    if medium_results:
+        lines += ["", "### 公開済み霊媒結果"]
+        for r in medium_results:
+            result_jp = "人狼" if r.get("result") == "werewolf" else "白（人間）"
+            lines.append(f"  - Day{r['day']}: {r['actor']} → {r['target']}: {result_jp}")
 
     return "\n".join(lines)
 
@@ -237,7 +283,7 @@ def next_disc_file(day: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Gemini API 呼び出し
+# LLM 呼び出し（Gemini / Claude）
 # ---------------------------------------------------------------------------
 
 def call_gemini(client, prompt: str) -> str:
@@ -249,7 +295,24 @@ def call_gemini(client, prompt: str) -> str:
             system_instruction=SYSTEM_INSTRUCTION,
         ),
     )
+    um = getattr(response, "usage_metadata", None)
+    if um:
+        _token_log["input"]  += getattr(um, "prompt_token_count", 0) or 0
+        _token_log["output"] += getattr(um, "candidates_token_count", 0) or 0
     return response.text
+
+
+def call_claude(client, prompt: str) -> str:
+    import anthropic
+    response = client.messages.create(
+        model=CLAUDE_MODEL_NAME,
+        max_tokens=2048,
+        system=SYSTEM_INSTRUCTION,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    _token_log["input"]  += response.usage.input_tokens
+    _token_log["output"] += response.usage.output_tokens
+    return response.content[0].text
 
 
 # ---------------------------------------------------------------------------
@@ -268,8 +331,8 @@ def run_validator(filepath: str) -> tuple[bool, str]:
 # シーン生成（リトライ付き）
 # ---------------------------------------------------------------------------
 
-def generate_scene(client, filepath: str, prompt: str, prefix: str = "") -> bool:
-    """Gemini でシーンを生成し validator を通す。最大 MAX_RETRIES 回リトライ。"""
+def generate_scene(filepath: str, prompt: str, prefix: str = "") -> bool:
+    """LLM でシーンを生成し validator を通す。最大 MAX_RETRIES 回リトライ。"""
     errors: str | None = None
     for attempt in range(1, MAX_RETRIES + 1):
         if errors:
@@ -280,8 +343,8 @@ def generate_scene(client, filepath: str, prompt: str, prefix: str = "") -> bool
         else:
             retry_prompt = prompt
 
-        print(f"[Gemini] 生成中... (試行 {attempt}/{MAX_RETRIES})", file=sys.stderr)
-        text = call_gemini(client, retry_prompt)
+        print(f"[LLM] 生成中... (試行 {attempt}/{MAX_RETRIES})", file=sys.stderr)
+        text = _call_fn(retry_prompt)
         if prefix:
             text = prefix + "\n" + text
         Path(filepath).write_text(text, encoding="utf-8")
@@ -414,7 +477,7 @@ def cmd_morning(client, state: dict, chars: list, player: str) -> None:
 
 出力: {filepath} のテキストのみ（余分な説明・コードブロック不要）\
 """
-    if generate_scene(client, filepath, prompt):
+    if generate_scene(filepath, prompt):
         print(filepath)
 
 
@@ -428,6 +491,52 @@ def _load_prev_discs(day: int, disc_num: int) -> str:
     if not parts:
         return ""
     return "## 本日の議論（これまでの流れ・必ず把握して続けること）\n" + "\n\n".join(parts)
+
+
+def extract_co_from_scene(scene_text: str, day: int) -> None:
+    """生成済みシーンから新規COを抽出して .gm_notes.json の public_co_claims / public_medium_results を更新する。"""
+    role_jp_map = {"seer": "占い師", "medium": "霊媒師", "bodyguard": "狩人"}
+    prompt = f"""\
+以下の人狼ゲームシーンを読み、このシーン内で初めて役職をCOした発言を抽出してください。
+
+対象:
+- 占い師CO（「私が占い師」「占い師です」等）
+- 霊媒師CO（「霊媒師です」「霊媒師だ」等）
+- 狩人CO（「狩人です」「狩人だ」等）
+
+出力形式（JSONのみ。COがなければ空リスト）:
+{{"co_claims": [{{"name": "キャラ名", "role": "seer|medium|bodyguard"}}]}}
+
+---
+{scene_text}
+"""
+    try:
+        raw = _call_fn(prompt).strip()
+        # コードブロック除去
+        raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+        data = json.loads(raw)
+        claims = data.get("co_claims", [])
+    except Exception:
+        return  # 抽出失敗は無視（次のシーン生成に影響しない）
+
+    if not claims:
+        return
+
+    notes = load_notes()
+    existing = notes.setdefault("public_co_claims", {})
+    changed = False
+    for c in claims:
+        name = c.get("name", "")
+        role = c.get("role", "")
+        if name and role and name not in existing:
+            existing[name] = {"role": role, "day": day}
+            changed = True
+            print(f"[CO追跡] {name} → {role_jp_map.get(role, role)} CO (Day{day})", file=sys.stderr)
+
+    if changed:
+        notes["public_co_claims"] = existing
+        with open(NOTES_FILE, "w", encoding="utf-8") as f:
+            json.dump(notes, f, ensure_ascii=False, indent=2)
 
 
 def cmd_discussion(client, state: dict, chars: list, player: str, context: str = "") -> None:
@@ -476,7 +585,9 @@ def cmd_discussion(client, state: dict, chars: list, player: str, context: str =
 出力: {filepath} のテキストのみ（余分な説明・コードブロック不要）\
 """
     prefix = f'{player}「{context}」' if context else ""
-    if generate_scene(client, filepath, prompt, prefix=prefix):
+    if generate_scene(filepath, prompt, prefix=prefix):
+        scene_text = Path(filepath).read_text(encoding="utf-8")
+        extract_co_from_scene(scene_text, day)
         print(filepath)
 
 
@@ -508,7 +619,7 @@ def cmd_vote(client, state: dict, chars: list, player: str) -> None:
 
 出力: {filepath} のテキストのみ（余分な説明・コードブロック不要）\
 """
-    if generate_scene(client, filepath, prompt):
+    if generate_scene(filepath, prompt):
         print(filepath)
 
 
@@ -550,7 +661,7 @@ def cmd_execution(client, state: dict, chars: list, player: str) -> None:
 
 出力: {filepath} のテキストのみ（余分な説明・コードブロック不要）\
 """
-    if generate_scene(client, filepath, prompt):
+    if generate_scene(filepath, prompt):
         print(filepath)
 
 
@@ -587,7 +698,7 @@ def cmd_epilogue(client, state: dict, chars: list, player: str) -> None:
 
 出力: {filepath} のテキストのみ（余分な説明・コードブロック不要）\
 """
-    if generate_scene(client, filepath, prompt):
+    if generate_scene(filepath, prompt):
         print(filepath)
 
 
@@ -624,7 +735,7 @@ def cmd_epilogue_thread(client, state: dict, chars: list, player: str) -> None:
 
 出力: {filepath} のテキストのみ（余分な説明・コードブロック不要）\
 """
-    if generate_scene(client, filepath, prompt):
+    if generate_scene(filepath, prompt):
         print(filepath)
 
 
@@ -633,7 +744,9 @@ def cmd_epilogue_thread(client, state: dict, chars: list, player: str) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Gemini GM: ナラティブ生成エンジン")
+    global _call_fn
+
+    parser = argparse.ArgumentParser(description="GM ナラティブ生成エンジン")
     parser.add_argument(
         "scene",
         choices=["morning", "discussion", "vote", "execution", "epilogue", "epilogue-thread"],
@@ -643,9 +756,21 @@ def main() -> None:
         "--context", default="",
         help="プレイヤーの直前の発言（discシーンに組み込まれる）",
     )
+    parser.add_argument(
+        "--backend", choices=["gemini", "claude"], default="gemini",
+        help="LLM バックエンド（デフォルト: gemini）",
+    )
     args = parser.parse_args()
 
-    client = init_gemini()
+    if args.backend == "claude":
+        client  = init_claude()
+        _call_fn = lambda p: call_claude(client, p)
+        backend_label = f"Claude ({CLAUDE_MODEL_NAME})"
+    else:
+        client  = init_gemini()
+        _call_fn = lambda p: call_gemini(client, p)
+        backend_label = f"Gemini ({MODEL_NAME})"
+
     state  = load_state()
     chars  = load_chars()
     player = pname()
@@ -662,6 +787,14 @@ def main() -> None:
         cmd_discussion(client, state, chars, player, context=args.context)
     else:
         dispatch[args.scene](client, state, chars, player)
+
+    # トークンサマリー
+    total = _token_log["input"] + _token_log["output"]
+    print(
+        f"[tokens] backend={backend_label}  "
+        f"input={_token_log['input']}  output={_token_log['output']}  total={total}",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":
