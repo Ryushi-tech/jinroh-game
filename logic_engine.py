@@ -324,3 +324,103 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ---------------------------------------------------------------------------
+# Player-view filter (for multi-agent NPC system)
+# ---------------------------------------------------------------------------
+
+_ROLE_JP = {
+    "villager": "村人", "werewolf": "人狼", "seer": "占い師",
+    "medium": "霊媒師", "bodyguard": "狩人", "madman": "狂人",
+}
+
+
+def get_player_view(state: dict, target_player: str, notes: dict) -> dict:
+    """target_player の視点でフィルター済みのゲーム情報を返す。
+
+    戻り値は Gemini NPC エージェントにそのまま渡せる clean dict。
+    役職情報は本人分のみ。wolf_teammates は狼の場合のみ仲間名リスト。
+    """
+    p = next((q for q in state["players"] if q["name"] == target_player), None)
+    if p is None:
+        raise ValueError(f"プレイヤー {target_player} が見つかりません")
+
+    role    = p["role"]
+    role_jp = _ROLE_JP.get(role, role)
+
+    # 仲間の狼（狼陣営のみ知っている情報）
+    wolf_teammates: list[str] = []
+    if role == "werewolf":
+        wolf_teammates = [
+            q["name"] for q in state["players"]
+            if q["role"] == "werewolf" and q["name"] != target_player
+        ]
+
+    # 生存者・死亡者
+    alive_players_list = [q["name"] for q in state["players"] if q["alive"]]
+
+    dead_players: list[dict] = []
+    for q in state["players"]:
+        if not q["alive"]:
+            cause = "死亡"
+            for e in reversed(state["log"]):
+                if e["type"] == "execute" and e["target"] == q["name"]:
+                    cause = f"Day{e['day']} 処刑"
+                    break
+                if (e["type"] == "attack" and e["target"] == q["name"]
+                        and e.get("result") == "killed"):
+                    cause = f"Day{e['day']} 夜・襲撃死"
+                    break
+            dead_players.append({"name": q["name"], "cause": cause})
+
+    # 公開CO一覧（notes["public_co_claims"] をそのまま渡す）
+    public_co_claims: dict = notes.get("public_co_claims", {})
+
+    # 公開占い結果: 生存かつ公開CO済みの占い師のlogエントリのみ
+    alive_set = set(alive_players_list)
+    co_seer_names = {
+        name for name, info in public_co_claims.items()
+        if isinstance(info, dict) and info.get("role") == "seer"
+        and name in alive_set
+    }
+    public_seer_results: list[dict] = []
+    for e in state["log"]:
+        if e["type"] == "seer" and e.get("actor", "") in co_seer_names:
+            result_jp = "人狼" if e["result"] == "werewolf" else "白（人間）"
+            public_seer_results.append({
+                "actor": e["actor"],
+                "target": e["target"],
+                "result": result_jp,
+                "day": e["day"],
+            })
+
+    # 公開霊媒結果（notes["public_medium_results"] をそのまま渡す）
+    public_medium_results: list = notes.get("public_medium_results", [])
+
+    # 処刑履歴（alignment フィールドは除外して渡す）
+    execution_history: list[dict] = []
+    for e in state["log"]:
+        if e["type"] == "execute":
+            execution_history.append({
+                "day":    e["day"],
+                "target": e["target"],
+                "tally":  e.get("tally", {}),
+                "votes":  e.get("votes", {}),
+            })
+
+    return {
+        "day": state["day"],
+        "self": {
+            "name":    target_player,
+            "role":    role,
+            "role_jp": role_jp,
+        },
+        "wolf_teammates":       wolf_teammates,
+        "alive_players":        alive_players_list,
+        "dead_players":         dead_players,
+        "public_co_claims":     public_co_claims,
+        "public_seer_results":  public_seer_results,
+        "public_medium_results": public_medium_results,
+        "execution_history":    execution_history,
+    }

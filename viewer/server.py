@@ -21,6 +21,7 @@ STATE_FILE = os.path.join(PROJECT_ROOT, "game_state.json")
 CHARACTERS_FILE = os.path.join(PROJECT_ROOT, "characters.json")
 PLAYER_NAME_FILE = os.path.join(PROJECT_ROOT, ".player_name")
 CHARA_IMAGE_DIR = os.path.join(PROJECT_ROOT, "chara_image")
+TYPING_FILE = os.path.join(PROJECT_ROOT, ".typing_now")
 
 ROLE_JP = {
     "villager": "村人",
@@ -216,9 +217,10 @@ def list_scene_files():
 
 def _scene_sort_key(fname):
     """シーンファイルをゲーム内時系列順にソートするキー。"""
-    # scene_epilogue は最後
+    # scene_epilogue は最後（epilogue.txt → epilogue_thread.txt の順）
     if fname.startswith("scene_epilogue"):
-        return (999, 999, "")
+        order = 1 if "_thread" in fname else 0
+        return (999, order, "")
 
     # scene_dayN_xxx.txt からday番号とフェーズ名を抽出
     m = re.match(r"scene_day(\d+)(?:_(.+))?\.txt", fname)
@@ -267,13 +269,17 @@ def read_scene_file(name):
 
 
 def compute_hash():
-    """変更検知用ハッシュ。state mtime + scene ファイル一覧。"""
+    """変更検知用ハッシュ。state mtime + typing mtime + scene ファイル一覧。"""
     h = hashlib.md5()
     try:
         mtime = os.path.getmtime(STATE_FILE)
         h.update(str(mtime).encode())
     except OSError:
         h.update(b"no-state")
+    try:
+        h.update(str(os.path.getmtime(TYPING_FILE)).encode())
+    except OSError:
+        pass
 
     scenes = list_scene_files()
     h.update(json.dumps(scenes).encode())
@@ -303,6 +309,13 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 self._error(404, "Scene not found")
             else:
                 self._json_response({"name": name, "content": content})
+        elif path == "/api/typing":
+            try:
+                with open(TYPING_FILE, encoding="utf-8") as f:
+                    data = json.load(f)
+                self._json_response(data)
+            except (FileNotFoundError, json.JSONDecodeError):
+                self._json_response({"npc": None, "scene": None})
         elif path == "/api/hash":
             self._json_response({"hash": compute_hash()})
         elif path == "/api/characters":

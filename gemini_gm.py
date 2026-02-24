@@ -21,13 +21,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+import npc_agent as _npc_agent
+
 STATE_FILE        = "game_state.json"
 CHAR_FILE         = "characters.json"
 PLAYER_FILE       = ".player_name"
 NOTES_FILE        = ".gm_notes.json"
-MODEL_NAME        = "gemini-2.5-pro"
+MODEL_NAME        = "gemini-2.5-flash"
 CLAUDE_MODEL_NAME = "claude-haiku-4-5-20251001"
 MAX_RETRIES       = 3
+TYPING_FILE       = Path(".typing_now")
 
 # ---------------------------------------------------------------------------
 # バックエンド切り替え用グローバル
@@ -362,72 +365,105 @@ def generate_scene(filepath: str, prompt: str, prefix: str = "") -> bool:
 
 
 # ---------------------------------------------------------------------------
-# CO インストラクション構築
+# CO ヒント構築（マルチエージェント用）
 # ---------------------------------------------------------------------------
 
-def build_co_instruction(state: dict, player: str, brief: dict, disc_num: int) -> str:
-    """disc1 用の占い師CO指示文を生成する（Gemini プロンプト内部用）。"""
+def _build_co_hints(state: dict, player: str, brief: dict, disc_num: int) -> dict[str, str]:
+    """disc1 用の NPC ごとの CO 指示を生成する。
+    Returns: {npc_name: co_hint_text} — disc_num != 1 の場合は空dict。
+    """
     if disc_num != 1:
-        return ""
+        return {}
 
     counter_co_raw = brief.get("COUNTER_CO", "none")
-    co_order       = brief.get("CO_ORDER", "real_first")
-    day            = state["day"]
+    fake_co_names = [
+        n.strip() for n in counter_co_raw.split(",")
+        if n.strip() and n.strip() != "none"
+    ]
 
-    fake_co_names = [n.strip() for n in counter_co_raw.split(",")
-                     if n.strip() and n.strip() != "none"]
+    hints: dict[str, str] = {}
 
-    # 真占い師（NPC）を特定
-    real_seer = next(
-        (p["name"] for p in state["players"]
-         if p["role"] == "seer" and p["alive"] and p["name"] != player
-         and p["name"] not in fake_co_names),
-        None,
+    # 偽COするNPCへの指示
+    for name in fake_co_names:
+        hints[name] = "disc1で占い師としてCOしてください（村を混乱させるための偽CO戦略）。ただし占い結果は絶対に出さないこと（Day1は初日占いなしのため結果が存在しない）"
+
+    # 真占い師NPCへの指示（プレイヤーが占い師でない場合のみ）
+    player_is_seer = next(
+        (p["role"] == "seer" for p in state["players"] if p["name"] == player),
+        False,
     )
-
-    # 真占い師の公開済み占い結果（生存しているときのみ意味がある）
-    seer_results_text = ""
-    if real_seer:
-        results = [
-            e for e in state["log"]
-            if e["type"] == "seer" and e.get("actor") == real_seer
-        ]
-        if results:
-            parts = []
-            for e in results:
-                result_jp = "人狼" if e["result"] == "werewolf" else "白（人間）"
-                parts.append(f"Day{e['day']}夜 → {e['target']}: {result_jp}")
-            seer_results_text = f"（占い結果: {' / '.join(parts)}）"
-        elif day == 1:
-            seer_results_text = "（初日のため結果なし）"
-
-    lines = ["## [GMの内部指示] disc1 での占いCO（出力には役職名を書かないこと）"]
-
-    def real_seer_line():
+    if not player_is_seer:
+        real_seer = next(
+            (p for p in state["players"]
+             if p["role"] == "seer" and p["alive"] and p["name"] != player
+             and p["name"] not in fake_co_names),
+            None,
+        )
         if real_seer:
-            return f"  - {real_seer} が占い師としてCOする {seer_results_text}"
-        return ""
+            results = [
+                e for e in state["log"]
+                if e["type"] == "seer" and e.get("actor") == real_seer["name"]
+            ]
+            if results:
+                parts = []
+                for e in results:
+                    result_jp = "人狼" if e["result"] == "werewolf" else "白（人間）"
+                    parts.append(f"Day{e['day']}夜 → {e['target']}: {result_jp}")
+                results_text = f"（占い結果: {' / '.join(parts)}）"
+            else:
+                results_text = "（初日のため結果なし）"
+            hints[real_seer["name"]] = (
+                f"disc1で占い師としてCOしてください {results_text}"
+            )
 
-    def fake_seer_line():
-        if fake_co_names:
-            names = "、".join(fake_co_names)
-            return f"  - {names} が占い師として対抗COする（村を混乱させる虚偽のCO）"
-        return ""
+    return hints
 
-    if co_order == "counter_first":
-        if fake_seer_line():
-            lines.append(fake_seer_line())
-        if real_seer_line():
-            lines.append(real_seer_line())
-    else:  # real_first
-        if real_seer_line():
-            lines.append(real_seer_line())
-        if fake_seer_line():
-            lines.append(fake_seer_line())
 
-    if len(lines) == 1:
-        return ""  # COなし
-    return "\n".join(lines)
+# ---------------------------------------------------------------------------
+# シーン組み立て（マルチエージェント用）
+# ---------------------------------------------------------------------------
+
+def _build_waves(npc_names: list[str], co_hints: dict[str, str]) -> list[list[str]]:
+    """NPC をウェーブに分割する。
+
+    アナウンス担当（co_hints あり）がいる場合:
+      Wave 1 = アナウンス担当（占い師CO・偽CO）
+      Wave 2 = 残り全員（Wave 1 の発言を見てから生成）
+
+    アナウンス担当がいない場合（通常 disc）:
+      4 名以上なら先頭 2 名を Wave 1（種まき）、残りを Wave 2（リアクター）
+      3 名以下は 1 ウェーブ（全並列）
+    """
+    announcers = [n for n in npc_names if n in co_hints]
+    reactors   = [n for n in npc_names if n not in co_hints]
+
+    if announcers:
+        return [announcers, reactors] if reactors else [announcers]
+
+    if len(npc_names) >= 4:
+        return [npc_names[:2], npc_names[2:]]
+
+    return [npc_names]
+
+
+def _clear_typing() -> None:
+    """入力中インジケータファイルを削除する。"""
+    try:
+        TYPING_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _assemble_scene(results: list[dict], player: str, context: str = "") -> str:
+    """NPC 発言結果リストからシーンテキストを組み立てる。"""
+    lines: list[str] = []
+    if context:
+        lines += [f'{player}「{context}」', ""]
+    for r in results:
+        msg = r.get("message", "").strip()
+        if msg:
+            lines += [msg, ""]
+    return "\n".join(lines).strip() + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -544,54 +580,118 @@ def cmd_discussion(client, state: dict, chars: list, player: str, context: str =
     brief    = run_discussion_brief()
     filepath = next_disc_file(day)
     disc_num = int(re.search(r"disc(\d+)", filepath).group(1))
+    notes    = load_notes()
 
-    alive_names    = [p["name"] for p in state["players"] if p["alive"]]
-    state_summary  = build_state_summary(state, player)
-    char_info      = build_char_info(chars, alive_names)
-    co_instruction = build_co_instruction(state, player, brief, disc_num)
-    prev_discs     = _load_prev_discs(day, disc_num)
+    # NPC名リスト（生存かつプレイヤー除外）
+    npc_names = [p["name"] for p in state["players"] if p["alive"] and p["name"] != player]
 
-    brief_text = "\n".join(f"- {k}: {v}" for k, v in brief.items())
+    # CO指示を NPC ごとに構築
+    co_hints = _build_co_hints(state, player, brief, disc_num)
 
-    confirmed_black = brief.get("CONFIRMED_BLACK", "none")
-    confirmed_white = brief.get("CONFIRMED_WHITE", "none")
-    vote_plan       = brief.get("VOTE_PLAN", "none")
+    # CO順序制御（disc1 のみ）
+    if disc_num == 1:
+        counter_co_raw = brief.get("COUNTER_CO", "none")
+        co_order = brief.get("CO_ORDER", "real_first")
+        fake_co_names = [
+            n.strip() for n in counter_co_raw.split(",")
+            if n.strip() and n.strip() != "none"
+        ]
+        if fake_co_names:
+            fake_set = set(fake_co_names)
+            others   = [n for n in npc_names if n not in fake_set]
+            fakes    = [n for n in npc_names if n in fake_set]
+            if co_order == "counter_first":
+                npc_names = fakes + others
+            else:  # real_first
+                npc_names = others + fakes
 
-    prompt = f"""\
-{state_summary}
+    # ウェーブ分割（アナウンス担当が先行、残りが反応）
+    waves = _build_waves(npc_names, co_hints)
 
-{char_info}
+    # 前disc文脈
+    context_discs = _load_prev_discs(day, disc_num)
 
-## GMブリーフィング（内部情報・出力には含めないこと）
-{brief_text}
+    errors_str: str | None = None
+    scene_text = ""
 
-{co_instruction}
+    try:
+        for attempt in range(1, MAX_RETRIES + 1):
+            # リトライ時はエラーを全NPCの指示に追記
+            current_hints = dict(co_hints)
+            if errors_str:
+                for name in npc_names:
+                    existing = current_hints.get(name, "")
+                    current_hints[name] = (
+                        (existing + "\n\n" if existing else "")
+                        + f"前回のバリデーションエラー（必ず修正してください）:\n{errors_str}"
+                    )
 
-{prev_discs}
+            print(
+                f"[LLM] NPC発言を直列生成中... (試行 {attempt}/{MAX_RETRIES})",
+                file=sys.stderr,
+            )
 
-## タスク: Day {day} 議論シーン {disc_num} を生成してください
-{f"## プレイヤーの直前の発言（この直後からシーンを続けること）{chr(10)}{player}「{context}」{chr(10)}" if context else ""}
-生成ルール:
-- 生存者のみが発言する（死亡者は絶対に発言させない）
-- これまでの議論（上記）で出た情報・CO・発言を必ず踏まえて続けること
-- 確定黒 [{confirmed_black}] が存在する場合: 吊り最優先として議論を誘導する
-- 確定白 [{confirmed_white}] が存在する場合: 信頼できる存在として扱う
-- 村の多数派の投票予測 [{vote_plan}] を踏まえた議論にする
-- NPCは人狼ゲーム経験者として論理的・戦略的に議論する
-- 各キャラクターの一人称・語尾・口癖を厳守する
-- 発言フォーマット: 名前「セリフ」（役職付記禁止）
-- プレイヤー（{player}）の発言は最小限でよい（ユーザーが続きを担当する）
+            # 途中経過をシーンファイルに書き出しながら生成するコールバック
+            _partial_results: list[dict] = []
 
-出力: {filepath} のテキストのみ（余分な説明・コードブロック不要）\
-"""
-    prefix = f'{player}「{context}」' if context else ""
-    if generate_scene(filepath, prompt, prefix=prefix):
-        scene_text = Path(filepath).read_text(encoding="utf-8")
-        extract_co_from_scene(scene_text, day)
-        print(filepath)
+            def _on_progress(name: str, message: str | None, _fp: str = filepath) -> None:
+                if message is None:
+                    # 入力中: typing ファイルを更新
+                    TYPING_FILE.write_text(
+                        json.dumps({"npc": name, "scene": _fp}, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                else:
+                    # 完了: typing をクリアして部分シーンを書き出す
+                    _clear_typing()
+                    if message:
+                        _partial_results.append({"name": name, "message": message})
+                    partial_text = _assemble_scene(_partial_results, player, context)
+                    Path(_fp).write_text(partial_text, encoding="utf-8")
+
+            results = _npc_agent.generate_all_npc_messages(
+                npc_names=npc_names,
+                state=state,
+                notes=notes,
+                chars=chars,
+                co_hints=current_hints,
+                context_discs=context_discs,
+                player_context=f'{player}「{context}」' if context else "",
+                on_progress=_on_progress,
+                waves=waves,
+            )
+
+            scene_text = _assemble_scene(results, player, context)
+            Path(filepath).write_text(scene_text, encoding="utf-8")
+
+            ok, output = run_validator(filepath)
+            if ok:
+                print(f"[validator] OK → {filepath}", file=sys.stderr)
+                break
+
+            errors_str = output
+            print(f"[validator] FAIL (試行 {attempt}):\n{output}", file=sys.stderr)
+            if attempt == MAX_RETRIES:
+                print(
+                    f"ERROR: {MAX_RETRIES} 回試行してもバリデーションを通過できませんでした。",
+                    file=sys.stderr,
+                )
+                return
+    finally:
+        _clear_typing()  # 例外・早期returnでも必ずクリア
+
+    _npc_agent.save_thoughts(day, disc_num)
+    extract_co_from_scene(scene_text, day)
+    print(filepath)
 
 
-def cmd_vote(client, state: dict, chars: list, player: str) -> None:
+def cmd_vote(client, state: dict, chars: list, player: str, npc_votes: dict | None = None) -> None:
+    """投票宣言シーンを生成する。
+
+    npc_votes: {voter_name: target_name} の実際の投票結果（vote_decide済みの値）。
+               指定された場合は各NPCの投票先をそのままLLMに渡す。
+               None の場合は village_vote_target のみで生成（後方互換）。
+    """
     day      = state["day"]
     filepath = f"scene_day{day}_vote.txt"
     notes    = load_notes()
@@ -599,7 +699,17 @@ def cmd_vote(client, state: dict, chars: list, player: str) -> None:
     alive_names   = [p["name"] for p in state["players"] if p["alive"]]
     state_summary = build_state_summary(state, player)
     char_info     = build_char_info(chars, alive_names)
-    vote_target   = notes.get("village_vote_target", "未定")
+
+    if npc_votes:
+        votes_lines = "\n".join(
+            f"- {voter}→{target}"
+            for voter, target in npc_votes.items()
+            if voter != player
+        )
+        vote_instruction = f"各NPCの実際の投票先（この通りに台詞を書くこと）:\n{votes_lines}"
+    else:
+        vote_target = notes.get("village_vote_target", "未定")
+        vote_instruction = f"村の多数派の投票先（NPC村人陣営はここに投票する）: {vote_target}"
 
     prompt = f"""\
 {state_summary}
@@ -608,7 +718,7 @@ def cmd_vote(client, state: dict, chars: list, player: str) -> None:
 
 ## タスク: Day {day} 投票宣言シーンを生成してください
 
-村の多数派の投票先（NPC村人陣営はここに投票する）: {vote_target}
+{vote_instruction}
 
 生成ルール:
 - 各 NPC が投票先を宣言する場面を描写する
@@ -760,6 +870,10 @@ def main() -> None:
         "--backend", choices=["gemini", "claude"], default="gemini",
         help="LLM バックエンド（デフォルト: gemini）",
     )
+    parser.add_argument(
+        "--votes", default="",
+        help="vote シーン用: vote_decide が出力した NPC投票 JSON ({voter:target})",
+    )
     args = parser.parse_args()
 
     if args.backend == "claude":
@@ -770,6 +884,9 @@ def main() -> None:
         client  = init_gemini()
         _call_fn = lambda p: call_gemini(client, p)
         backend_label = f"Gemini ({MODEL_NAME})"
+
+    # NPC エージェントに call_fn を渡す
+    _npc_agent.init(_call_fn)
 
     state  = load_state()
     chars  = load_chars()
@@ -785,6 +902,9 @@ def main() -> None:
     }
     if args.scene == "discussion":
         cmd_discussion(client, state, chars, player, context=args.context)
+    elif args.scene == "vote":
+        npc_votes = json.loads(args.votes) if args.votes else None
+        cmd_vote(client, state, chars, player, npc_votes=npc_votes)
     else:
         dispatch[args.scene](client, state, chars, player)
 

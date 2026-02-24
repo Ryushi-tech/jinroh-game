@@ -192,7 +192,7 @@ def _confirmed_info(state):
     return black, white
 
 
-def _suspicion_scores(state, alive, confirmed_white, confirmed_black, player):
+def _suspicion_scores(state, alive, confirmed_white, confirmed_black, player, notes):
     """生存者ごとの怪しさスコアを計算する。"""
     scores = {p["name"]: 0 for p in alive if p["name"] != player}
 
@@ -208,9 +208,8 @@ def _suspicion_scores(state, alive, confirmed_white, confirmed_black, player):
         if name in scores:
             scores[name] -= 10
 
-    # 役職CO済み（占い師・霊媒師・狩人）→ 減点
-    co_actors = {e["actor"] for e in state["log"] if e["type"] == "seer"}
-    for name in co_actors:
+    # 公開CO済み（public_co_claims）→ 減点（内部logではなく公開情報を参照）
+    for name in notes.get("public_co_claims", {}):
         if name in scores:
             scores[name] -= 3
 
@@ -221,34 +220,47 @@ def _suspicion_scores(state, alive, confirmed_white, confirmed_black, player):
     return scores
 
 
-def _decide_attack_target(state, alive, seer_target, notes):
+def _decide_attack_target(state, alive, notes):
     """
-    人狼の襲撃先決定ロジック（優先順位順）:
-    1. 今夜 seer_target が人狼 → 占い師を狙う（護衛ギャンブル）
-    2. 直前の処刑が人狼      → 霊媒師を狙う（護衛ギャンブル）
-    3. それ以外              → wolf_accusations の疑惑者を優先、なければランダム
+    人狼の襲撃先決定ロジック（公開情報のみ使用）:
+    1. 公開CO済み占い師が存在 → CO者を狙う
+    2. 直前の処刑が人狼 かつ 公開CO済み霊媒師が存在 → 霊媒師CO者を狙う
+    3. wolf_accusations の疑惑者を優先、なければランダム
+
+    ※ 役職リストへの直接アクセスは禁止。狼が知れるのは
+       「互いの正体」と「公開されたCO・投票履歴」のみ。
     """
     wolf_names = {p["name"] for p in state["players"] if p["role"] == "werewolf"}
     non_wolves = [p["name"] for p in alive if p["role"] != "werewolf"]
+    alive_set  = {p["name"] for p in alive}
     if not non_wolves:
         return None
 
-    # Case 1: 今夜の占い先が人狼 → 占い師を狙う
-    if seer_target and seer_target in wolf_names:
-        seer = next((p["name"] for p in alive if p["role"] == "seer"), None)
-        if seer and seer in non_wolves:
-            return seer
+    # 公開CO情報（COした人のみ狼は特定できる）
+    co_claims = notes.get("public_co_claims", {})
 
-    # Case 2: 直前の処刑が人狼 → 霊媒師を狙う
+    # Case 1: 公開CO済み占い師を狙う（常に最優先）
+    seer_cos = [
+        name for name, info in co_claims.items()
+        if isinstance(info, dict) and info.get("role") == "seer"
+        and name in alive_set and name not in wolf_names
+    ]
+    if seer_cos:
+        return random.choice(seer_cos)
+
+    # Case 2: 直前の処刑が人狼 → 公開CO済み霊媒師を狙う
     last_exec = next((e for e in reversed(state["log"]) if e["type"] == "execute"), None)
     if last_exec and last_exec.get("alignment") == "werewolf":
-        medium = next((p["name"] for p in alive if p["role"] == "medium"), None)
-        if medium and medium in non_wolves:
-            return medium
+        medium_cos = [
+            name for name, info in co_claims.items()
+            if isinstance(info, dict) and info.get("role") == "medium"
+            and name in alive_set and name not in wolf_names
+        ]
+        if medium_cos:
+            return random.choice(medium_cos)
 
     # Case 3: wolf_accusations から生存狼への疑惑者を集め、最多の人を狙う
     accusations = notes.get("wolf_accusations", {})
-    alive_set = {p["name"] for p in alive}
     suspectors: dict[str, int] = {}
     for wolf_name, accusers in accusations.items():
         if wolf_name in wolf_names:  # 生存中の狼への疑惑のみカウント
@@ -329,7 +341,7 @@ def cmd_discussion_brief(_args):
     confirmed_white = [n for n in all_white if n in alive_set]
 
     # 2. 怪しさスコア
-    scores = _suspicion_scores(state, alive, confirmed_white, confirmed_black, player)
+    scores = _suspicion_scores(state, alive, confirmed_white, confirmed_black, player, notes)
 
     # 3. 対抗CO判断
     counter_co = _decide_counter_co(state, notes, player)
@@ -415,12 +427,16 @@ def cmd_night_actions(args):
             if npc_guard_target and npc_guard_target in cands:
                 guard_target = npc_guard_target
             else:
-                seer_co = next(
-                    (e["actor"] for e in state["log"] if e["type"] == "seer"), None
+                # 公開CO済み占い師を護衛（内部logではなく public_co_claims を参照）
+                alive_name_set = {p["name"] for p in alive}
+                seer_co_public = next(
+                    (n for n, info in notes.get("public_co_claims", {}).items()
+                     if isinstance(info, dict) and info.get("role") == "seer"
+                     and n in alive_name_set),
+                    None,
                 )
-                alive_names = [p["name"] for p in alive]
-                if seer_co and seer_co in alive_names and seer_co != prev:
-                    guard_target = seer_co
+                if seer_co_public and seer_co_public in cands:
+                    guard_target = seer_co_public
                 elif cands:
                     guard_target = random.choice(cands)
 
@@ -432,7 +448,7 @@ def cmd_night_actions(args):
         if args.attack: attack_target = args.attack
         else:           need_attack = True
     else:
-        attack_target = _decide_attack_target(state, alive, seer_target, notes)
+        attack_target = _decide_attack_target(state, alive, notes)
 
     if need_seer or need_guard or need_attack:
         if need_seer:   print("NEED_SEER_INPUT=true")
@@ -504,21 +520,32 @@ def cmd_vote_decide(args):
     # 死亡プレイヤーは投票できない
     player_alive = any(p["name"] == player and p["alive"] for p in state["players"])
     votes = {player: args.player_vote} if player_alive else {}
-    seer_co = next((e["actor"] for e in state["log"] if e["type"] == "seer"), None)
+
+    # 公開CO済み占い師（内部logではなく public_co_claims を参照）
+    alive_set_names = {p["name"] for p in alive}
+    wolf_names = {p["name"] for p in state["players"] if p["role"] == "werewolf"}
+    co_claims = notes.get("public_co_claims", {})
+    seer_cos_public = [
+        n for n, info in co_claims.items()
+        if isinstance(info, dict) and info.get("role") == "seer"
+        and n in alive_set_names
+    ]
+    public_seer_co = seer_cos_public[0] if seer_cos_public else None
 
     for p in alive:
         if p["name"] == player:
             continue
         if p["role"] == "werewolf":
+            # 狼が仲間を除外するのは陣営ボーナス（互いを知っている）として正当
             cands = [x["name"] for x in alive
-                     if x["role"] != "werewolf" and x["name"] != p["name"]]
+                     if x["name"] not in wolf_names and x["name"] != p["name"]]
             votes[p["name"]] = (
-                seer_co if seer_co and seer_co in cands
+                public_seer_co if public_seer_co and public_seer_co in cands
                 else random.choice(cands) if cands else None
             )
         elif p["role"] == "madman":
             cands = [x["name"] for x in alive
-                     if x["name"] != p["name"] and x["name"] != seer_co]
+                     if x["name"] != p["name"] and x["name"] != public_seer_co]
             if not cands:
                 cands = [x["name"] for x in alive if x["name"] != p["name"]]
             votes[p["name"]] = random.choice(cands) if cands else None
