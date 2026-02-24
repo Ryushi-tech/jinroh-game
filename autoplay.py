@@ -37,9 +37,13 @@ def parse_kv(text: str) -> dict[str, str]:
     return result
 
 
-def parse_npc_votes(text: str) -> dict[str, str]:
-    """vote_decide 出力の NPC_VOTES_START...NPC_VOTES_END ブロックを解析する。"""
-    result: dict[str, str] = {}
+def parse_npc_votes(text: str) -> dict[str, dict]:
+    """vote_decide 出力の NPC_VOTES_START...NPC_VOTES_END ブロックを解析する。
+
+    出力フォーマット: voter=target:reason_category
+    戻り値: {voter: {"target": str, "reason": str}}
+    """
+    result: dict[str, dict] = {}
     in_block = False
     for line in text.splitlines():
         if line.strip() == "NPC_VOTES_START":
@@ -47,8 +51,12 @@ def parse_npc_votes(text: str) -> dict[str, str]:
         elif line.strip() == "NPC_VOTES_END":
             in_block = False
         elif in_block and "=" in line:
-            k, _, v = line.partition("=")
-            result[k.strip()] = v.strip()
+            voter, _, rest = line.partition("=")
+            if ":" in rest:
+                target, _, reason = rest.partition(":")
+            else:
+                target, reason = rest, "consensus"
+            result[voter.strip()] = {"target": target.strip(), "reason": reason.strip()}
     return result
 
 

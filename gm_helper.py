@@ -569,12 +569,21 @@ def cmd_vote_decide(args):
         elif "決選の結果" in line:
             executed = line.split("決選の結果")[1].strip().split("を処刑")[0].strip()
 
+    # reason_category: 村の合意と一致するか否か（役職非依存の判定）
+    # pivot   = 村合意と異なる投票（LLM に「翻意の cover story」を書かせる）
+    # consensus = 村合意と一致（自然な流れで投票）
+    # conviction = village_vote_target 未設定のため各自の判断
+    def _reason(voter_name: str, target: str) -> str:
+        if not village_vote_target:
+            return "conviction"
+        return "consensus" if target == village_vote_target else "pivot"
+
     state = load_state()
     print(f"EXECUTED={executed or 'unknown'}")
     print("NPC_VOTES_START")
     for voter, target in votes.items():
         if voter != player:
-            print(f"{voter}={target}")
+            print(f"{voter}={target}:{_reason(voter, target)}")
     print("NPC_VOTES_END")
     print(f"WIN={win_status(state)}")
 

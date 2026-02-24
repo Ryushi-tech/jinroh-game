@@ -685,12 +685,33 @@ def cmd_discussion(client, state: dict, chars: list, player: str, context: str =
     print(filepath)
 
 
+_REASON_HINT = {
+    "consensus":  "議論の流れ・多数意見に沿った投票。これまでの発言と一貫した動機で宣言する。",
+    "pivot":      "議論中の自分の発言とは異なる相手に投票する。役職・裏の思惑は絶対に言わない。"
+                  "キャラクターに合った自然な「翻意の言い訳」を考えること。"
+                  "例: 直感が変わった / 最後の一手として / あえて流れを変えたい / 念のため など。",
+    "conviction": "自分の判断に基づく投票。根拠を一言添える。",
+}
+
+
+def _load_disc_context(day: int) -> str:
+    """当日の disc テキストを結合して返す（vote scene の文脈として使用）。"""
+    import glob as _glob
+    texts = []
+    for path in sorted(_glob.glob(f"scene_day{day}_disc*.txt")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                texts.append(f.read().strip())
+        except OSError:
+            pass
+    return "\n\n".join(texts)
+
+
 def cmd_vote(client, state: dict, chars: list, player: str, npc_votes: dict | None = None) -> None:
     """投票宣言シーンを生成する。
 
-    npc_votes: {voter_name: target_name} の実際の投票結果（vote_decide済みの値）。
-               指定された場合は各NPCの投票先をそのままLLMに渡す。
-               None の場合は village_vote_target のみで生成（後方互換）。
+    npc_votes: {voter_name: {"target": str, "reason": str}} の実際の投票結果。
+               vote_decide 済みの値。None の場合は village_vote_target のみで生成（後方互換）。
     """
     day      = state["day"]
     filepath = f"scene_day{day}_vote.txt"
@@ -699,23 +720,38 @@ def cmd_vote(client, state: dict, chars: list, player: str, npc_votes: dict | No
     alive_names   = [p["name"] for p in state["players"] if p["alive"]]
     state_summary = build_state_summary(state, player)
     char_info     = build_char_info(chars, alive_names)
+    disc_context  = _load_disc_context(day)
 
     if npc_votes:
-        votes_lines = "\n".join(
-            f"- {voter}→{target}"
-            for voter, target in npc_votes.items()
-            if voter != player
+        lines = []
+        for voter, info in npc_votes.items():
+            if voter == player:
+                continue
+            # info は {"target": ..., "reason": ...} または後方互換で str
+            if isinstance(info, dict):
+                target = info.get("target", "")
+                reason = info.get("reason", "consensus")
+            else:
+                target, reason = str(info), "consensus"
+            hint = _REASON_HINT.get(reason, _REASON_HINT["consensus"])
+            lines.append(f"- {voter} → {target}（演技指示: {hint}）")
+        vote_instruction = (
+            "## 各NPCの投票先と演技指示\n"
+            "投票先は決定済み。これまでの議論の流れを踏まえ、不自然にならない台詞を書くこと。\n"
+            "役職・裏の思惑は台詞に絶対に出さない。\n\n"
+            + "\n".join(lines)
         )
-        vote_instruction = f"各NPCの実際の投票先（この通りに台詞を書くこと）:\n{votes_lines}"
     else:
         vote_target = notes.get("village_vote_target", "未定")
         vote_instruction = f"村の多数派の投票先（NPC村人陣営はここに投票する）: {vote_target}"
+
+    context_section = f"\n## 本日の議論（参考: 各NPCの直前の発言）\n{disc_context}\n" if disc_context else ""
 
     prompt = f"""\
 {state_summary}
 
 {char_info}
-
+{context_section}
 ## タスク: Day {day} 投票宣言シーンを生成してください
 
 {vote_instruction}
@@ -724,8 +760,9 @@ def cmd_vote(client, state: dict, chars: list, player: str, npc_votes: dict | No
 - 各 NPC が投票先を宣言する場面を描写する
 - プレイヤー（{player}）の投票宣言は含めない（ユーザーが後で入力する）
 - 生存者のみが発言する
-- 各キャラクターの口調を維持する
+- 各キャラクターの口調・一人称・語尾を維持する
 - 発言フォーマット: 名前「セリフ」（役職付記禁止）
+- 「pivot」の NPC は翻意の理由を自然に語らせること。「なんとなく」「直感です」のみの一行は禁止。
 
 出力: {filepath} のテキストのみ（余分な説明・コードブロック不要）\
 """
