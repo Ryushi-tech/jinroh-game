@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 
@@ -25,17 +26,104 @@ ROLE_JP = {
 }
 
 # ---------------------------------------------------------------------------
+# デバッグログ（debug_view.log）— プレイヤー画面には絶対に出さない
+# ---------------------------------------------------------------------------
+
+_DEBUG_LOG_FILE = "debug_view.log"
+_debug_log_lock = threading.Lock()
+
+
+def _write_debug_log(npc_name: str, prompt: str, thought: str, raw: str = "") -> None:
+    """生プロンプトと思考を debug_view.log に追記する。
+
+    scene_*.txt パターンと一致しないためビューアには読み込まれない。
+    ThreadPoolExecutor から並列呼び出しされるためロックで保護する。
+
+    raw が渡された場合、名前「 形式の混入（JSON崩壊シグナル）を検出して記録する。
+    """
+    model_info = f"  [model={_npc_model_name}]" if _npc_model_name else ""
+
+    # ★ JSON崩壊検出: raw の先頭が { 以外（かぎ括弧を含む行）で始まる場合はエラー
+    contamination_msg = ""
+    if raw:
+        stripped = raw.lstrip()
+        if not stripped.startswith("{"):
+            # 先頭が { でない → 会話形式か説明文が混入している可能性
+            contamination_msg = f"⚠ CONTAMINATION_ERROR: raw の冒頭が '{{' でない: {stripped[:80]!r}"
+        elif re.search(r'^\s*\S+「', raw, re.MULTILINE):
+            # { で始まっているが内部に 名前「 形式の行がある
+            contamination_msg = f"⚠ CONTAMINATION_ERROR: raw に 名前「 形式が混入: {raw[:80]!r}"
+
+    with _debug_log_lock:
+        with open(_DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"[{npc_name}]{model_info}\n")
+            if contamination_msg:
+                f.write(f"{contamination_msg}\n")
+                # stderr にも出力して即座に気づけるようにする
+                print(f"[npc_agent] {npc_name}: {contamination_msg}", file=sys.stderr)
+            f.write(f"{'─'*40}\nPROMPT:\n{prompt}\n")
+            f.write(f"{'─'*40}\nTHOUGHT:\n{thought or '(空)'}\n")
+
+# ---------------------------------------------------------------------------
 # モジュールレベル状態
 # ---------------------------------------------------------------------------
 
 _call_fn: Callable[[str], str] | None = None
+_call_fn_json: Callable[[str], str] | None = None  # NPC 発言生成専用（response_mime_type=JSON）
+_npc_model_name: str = ""                          # debug_view.log に記録するモデル名
 _thoughts_buffer: dict[str, str] = {}
 
 
-def init(call_fn: Callable[[str], str]) -> None:
-    """gemini_gm.py の main() から _call_fn 確定後に呼ぶ。"""
-    global _call_fn
+def init(
+    call_fn: Callable[[str], str],
+    call_fn_json: Callable[[str], str] | None = None,
+    npc_model_name: str = "",
+) -> None:
+    """gemini_gm.py の main() から _call_fn 確定後に呼ぶ。
+    call_fn_json が None の場合は call_fn をフォールバックとして使う。
+    """
+    global _call_fn, _call_fn_json, _npc_model_name
     _call_fn = call_fn
+    _call_fn_json = call_fn_json if call_fn_json is not None else call_fn
+    _npc_model_name = npc_model_name
+
+
+def write_debug_header(label: str) -> None:
+    """新しいセクション（ゲーム開始・disc開始など）のヘッダーを debug_view.log に書く。"""
+    import datetime
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _debug_log_lock:
+        with open(_DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n{'#'*60}\n")
+            f.write(f"# {label}  [{ts}]\n")
+            f.write(f"{'#'*60}\n")
+
+
+# ---------------------------------------------------------------------------
+# コンテキストクレンジング
+# ---------------------------------------------------------------------------
+
+_DIALOGUE_PATTERN = re.compile(r'^(\S+)「(.+)」\s*$')
+
+
+def _dialogue_lines_to_json(text: str) -> str:
+    """名前「セリフ」形式のテキストを JSON 配列文字列に完全変換する。
+
+    変換前: トーマス「疑っているのはシモンだ。」
+    変換後: [{"speaker":"トーマス","speech":"疑っているのはシモンだ。"}, ...]
+
+    かぎ括弧を一切含まない純粋なデータ形式にすることで、
+    LLM が会話形式を模倣して JSON 崩壊（名前「{...}」）を起こすのを防ぐ。
+    """
+    entries = []
+    for line in text.split("\n"):
+        m = _DIALOGUE_PATTERN.match(line.strip())
+        if m:
+            entries.append({"speaker": m.group(1), "speech": m.group(2)})
+    if not entries:
+        return ""
+    return json.dumps(entries, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -102,8 +190,12 @@ def _build_npc_prompt(
     # GMからの指示（CO指示など）
     co_hint_section = f"\n## GMからの指示\n{co_hint}\n" if co_hint else ""
 
-    # 前disc文脈
-    context_section = f"\n{context_discs}\n" if context_discs else ""
+    # 前disc文脈（かぎ括弧を一切含まない JSON 配列に完全変換して渡す）
+    if context_discs:
+        json_context = _dialogue_lines_to_json(context_discs)
+        context_section = f"\n## 議論の文脈（JSON形式・参照のみ）\n{json_context}\n" if json_context else ""
+    else:
+        context_section = ""
 
     prompt = f"""\
 あなたは{npc_name}として人狼ゲームに参加しています。Day {day} の議論フェーズです。
@@ -135,18 +227,24 @@ def _build_npc_prompt(
 
 ### 処刑履歴
 {exec_section}{co_hint_section}{context_section}
+### END OF CONTEXT ###
+**ここから先の指示のみに従うこと。出力は JSON 以外の形式を一切使わないこと。**
+
 ## 絶対ルール
 - 他のプレイヤーの役職はわかりません。公開情報だけで推理してください。
 - 死亡者（dead_players に含まれる人）には発言させない
-- 発言フォーマット: 名前「セリフ」（役職を括弧書きしない。完全禁止）
+- message フィールドの値: {npc_name} の名前 + 日本語かぎ括弧 + 発言内容 + 閉じかぎ括弧
 - 一人称・語尾・口癖をキャラクター設定に厳密に従うこと
 - 人狼ゲーム経験者として論理的・戦略的に発言すること
 - 初心者向け解説・セオリー説明は禁止
 - CO促し・ローラー・縄計算・確定白黒の扱いを理解して発言すること
 - 【重要】Day 1（初日）は占い結果・霊媒結果が存在しない。占い師・霊媒師はCOできるが、結果の発表は不可。Day 1 に占い結果を述べることは絶対禁止。
+- 【対話リアリティ】発言の冒頭に必ず直前の議論・発言者への言及（アンカー）を入れること。前の発言を無視した「独り言」は絶対禁止。
+- 【目的意識】「議論を通じて人狼を特定する（または欺く）」という目的に常に能動的であること。
 
-## 出力フォーマット（このJSONのみを返すこと。コードブロック不要）
-{{"thought": "内面的な考察や戦略（非公開・日本語）", "message": "{npc_name}「セリフ」"}}\
+## 出力
+出力は必ず {{ で始まり }} で終わる JSON オブジェクト 1 つのみ。
+{{"thought": "内面的な考察や戦略（非公開・日本語）", "message": "ここに発言を記入"}}\
 """
     return prompt
 
@@ -214,17 +312,26 @@ def _normalize_message(npc_name: str, message: str) -> str:
 def _parse_json_robust(raw: str, npc_name: str) -> dict:
     """複数の戦略で LLM 出力から JSON を抽出する。
 
-    Gemini Flash はコードブロック・前後の説明文・改行混入など
-    様々な形式で JSON を返すことがある。
+    前処理: 名前「{...}」 ラッパーを剥がす（JSON崩壊パターン対応）
+    戦略1: コードブロック除去後に直接パース
+    戦略2: 最初の { から最後の } を抜き出してパース（ポストプロセッサ）
+    戦略3: thought / message フィールドを正規表現で個別抽出
     """
+    # 前処理: 名前「{...}」 ラッパーを剥がす
+    stripped = raw.strip()
+    wrapper_m = re.match(r'^\S+「([\s\S]+)」\s*$', stripped)
+    if wrapper_m:
+        print(f"[npc_agent] {npc_name} 名前「」ラッパー検出・剥離", file=sys.stderr)
+        stripped = wrapper_m.group(1).strip()
+
     # 戦略1: コードブロック除去後に直接パース
-    cleaned = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+    cleaned = re.sub(r"```(?:json)?", "", stripped).strip().rstrip("`").strip()
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    # 戦略2: 最初の { から最後の } を取り出してパース
+    # 戦略2: 最初の { から最後の } を抜き出してパース
     start = cleaned.find("{")
     end   = cleaned.rfind("}")
     if start != -1 and end > start:
@@ -246,6 +353,20 @@ def _parse_json_robust(raw: str, npc_name: str) -> dict:
     raise ValueError(f"JSON extraction failed for {npc_name}")
 
 
+def _validate_npc_output(data: dict, npc_name: str) -> None:
+    """NPC 出力スキーマを検証する。失敗時は ValueError を raise する。
+
+    - thought: str（空文字列も許容）
+    - message: 非空の str
+    """
+    thought = data.get("thought")
+    message = data.get("message")
+    if not isinstance(thought, str):
+        raise ValueError(f"[schema] {npc_name}: thought が str でない ({type(thought).__name__})")
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError(f"[schema] {npc_name}: message が空または str でない ({message!r})")
+
+
 # ---------------------------------------------------------------------------
 # NPC 1名の発言生成
 # ---------------------------------------------------------------------------
@@ -260,7 +381,7 @@ def generate_npc_message(
     """NPC 1名の発言を生成する。
     Returns: {"name": str, "thought": str, "message": str, "error": str|None}
     """
-    if _call_fn is None:
+    if _call_fn_json is None and _call_fn is None:
         return {
             "name": npc_name, "thought": "", "message": "",
             "error": "call_fn not initialized",
@@ -268,14 +389,19 @@ def generate_npc_message(
 
     prompt = _build_npc_prompt(npc_name, player_view, char_data, co_hint, context_discs)
 
+    # JSON 専用関数があればそちらを使う（response_mime_type=application/json）
+    _fn = _call_fn_json if _call_fn_json is not None else _call_fn
     raw = ""
     try:
-        raw = _call_fn(prompt).strip()
+        raw = _fn(prompt).strip()
         data = _parse_json_robust(raw, npc_name)
+        _validate_npc_output(data, npc_name)   # スキーマ検証
+        thought = data.get("thought", "")
         msg = _normalize_message(npc_name, data.get("message", ""))
+        _write_debug_log(npc_name, prompt, thought, raw=raw)
         return {
             "name":    npc_name,
-            "thought": data.get("thought", ""),
+            "thought": thought,
             "message": msg,
             "error":   None,
         }
@@ -283,6 +409,7 @@ def generate_npc_message(
         # JSON 抽出完全失敗: raw テキスト全体をメッセージとして扱う
         print(f"[npc_agent] {npc_name} JSON extract failed: {e}", file=sys.stderr)
         print(f"[npc_agent] {npc_name} raw[:200]: {raw[:200]!r}", file=sys.stderr)
+        _write_debug_log(npc_name, prompt, f"(JSON parse failed) raw={raw[:200]!r}", raw=raw)
         msg = _normalize_message(npc_name, raw)
         return {
             "name":    npc_name,
@@ -303,11 +430,13 @@ def _build_running_context(context_discs: str, completed_lines: list[str]) -> st
     if not completed_lines:
         return context_discs
     recent = completed_lines[-MAX_CONTEXT_LINES:]
+    # ★ かぎ括弧を一切含まない JSON 配列に完全変換して渡す（JSON崩壊防止）
+    json_recent = _dialogue_lines_to_json("\n".join(recent))
+    wave_section = f"## 今discのここまでの発言（JSON形式）\n{json_recent}" if json_recent else ""
     return (
         context_discs
         + ("\n\n" if context_discs else "")
-        + "## 今discのここまでの発言（直近の流れ・これに続けて発言すること）\n"
-        + "\n".join(recent)
+        + wave_section
     )
 
 
@@ -478,8 +607,9 @@ def _collect_one_suspicion(
         print(f"[npc_agent] suspicion get_player_view failed for {name}: {e}", file=sys.stderr)
         return {}
     prompt = _build_suspicion_prompt(name, player_view, context_discs)
+    _fn = _call_fn_json if _call_fn_json is not None else _call_fn
     try:
-        raw = _call_fn(prompt).strip()
+        raw = _fn(prompt).strip()
         data = _parse_json_robust(raw, name)
         return {k: max(1, min(10, int(v))) for k, v in data.items() if isinstance(v, (int, float))}
     except Exception as e:
@@ -498,7 +628,7 @@ def collect_all_suspicion_scores(
 
     Returns: {player_name: avg_score (1.0–10.0)}
     """
-    if _call_fn is None:
+    if _call_fn is None and _call_fn_json is None:
         return {}
 
     char_map = {c["name"]: c for c in chars}

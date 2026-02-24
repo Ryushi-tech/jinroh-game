@@ -27,7 +27,9 @@ STATE_FILE        = "game_state.json"
 CHAR_FILE         = "characters.json"
 PLAYER_FILE       = ".player_name"
 NOTES_FILE        = ".gm_notes.json"
-MODEL_NAME        = "gemini-2.5-flash"
+GM_MODEL_NAME     = "gemini-2.5-pro"     # GM 用（シーン描写・進行・判定）
+NPC_MODEL_NAME    = "gemini-2.5-flash"   # NPC エージェント用（NPC発言生成）
+MODEL_NAME        = GM_MODEL_NAME        # call_gemini() 等の後方互換用エイリアス
 CLAUDE_MODEL_NAME = "claude-haiku-4-5-20251001"
 MAX_RETRIES       = 3
 TYPING_FILE       = Path(".typing_now")
@@ -273,6 +275,16 @@ alive: false のキャラクターに一切発言させない。
 - 占い・霊媒結果は「COして発表する」形式でのみ公開できる。\
 """
 
+# NPC エージェント専用システム指示（JSON 出力を強制）
+# ★ 会話形式（かぎ括弧）への言及を一切含めない ― モデルが模倣するのを防ぐため
+NPC_AGENT_SYSTEM = """\
+あなたは人狼ゲームの NPC エージェントです。
+出力は必ず JSON オブジェクト 1 つだけです。
+コードブロック・説明文・会話形式など JSON 以外の出力は絶対禁止。
+出力の冒頭は必ず { で始め、末尾は } で終わること。
+スキーマ: {"thought": "string", "message": "string"}\
+"""
+
 
 # ---------------------------------------------------------------------------
 # ファイル名ユーティリティ
@@ -305,12 +317,44 @@ def call_gemini(client, prompt: str) -> str:
     return response.text
 
 
+def call_gemini_json(client, prompt: str) -> str:
+    """NPC エージェント専用: JSON 出力を強制するバリアント（Flash モデルを使用）。"""
+    from google.genai import types
+    response = client.models.generate_content(
+        model=NPC_MODEL_NAME,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=NPC_AGENT_SYSTEM,
+            response_mime_type="application/json",
+        ),
+    )
+    um = getattr(response, "usage_metadata", None)
+    if um:
+        _token_log["input"]  += getattr(um, "prompt_token_count", 0) or 0
+        _token_log["output"] += getattr(um, "candidates_token_count", 0) or 0
+    return response.text
+
+
 def call_claude(client, prompt: str) -> str:
     import anthropic
     response = client.messages.create(
         model=CLAUDE_MODEL_NAME,
         max_tokens=2048,
         system=SYSTEM_INSTRUCTION,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    _token_log["input"]  += response.usage.input_tokens
+    _token_log["output"] += response.usage.output_tokens
+    return response.content[0].text
+
+
+def call_claude_json(client, prompt: str) -> str:
+    """NPC エージェント専用: JSON 指示に特化したバリアント。"""
+    import anthropic
+    response = client.messages.create(
+        model=CLAUDE_MODEL_NAME,
+        max_tokens=2048,
+        system=NPC_AGENT_SYSTEM,
         messages=[{"role": "user", "content": prompt}],
     )
     _token_log["input"]  += response.usage.input_tokens
@@ -506,7 +550,8 @@ def cmd_morning(client, state: dict, chars: list, player: str) -> None:
 生成ルール:
 - 夜明けの村、前夜の出来事が明らかになる場面を描写する
 - 犠牲者がいる場合: {victim} の死体発見と村人の動揺を描写する
-- 犠牲者がいない場合: 「昨晩の犠牲者はなし」とだけ告知する（護衛成功かどうかは触れない）
+- 犠牲者がいない場合: 犠牲者がいなかった旨を地の文（ナレーション）として書くこと
+  ※ 話者不明の「セリフ」形式（例: 「昨晩の犠牲者はなし」）は絶対禁止。キャラクターの発言なら名前「セリフ」形式で。
 - 生存者数名が反応してよい（全員でなくてもよい）
 - 200〜400 文字程度
 - プレイヤー（{player}）の発言を生成してもよいが、自然な範囲で
@@ -681,6 +726,7 @@ def cmd_discussion(client, state: dict, chars: list, player: str, context: str =
         _clear_typing()  # 例外・早期returnでも必ずクリア
 
     _npc_agent.save_thoughts(day, disc_num)
+    _npc_agent.write_debug_header(f"Day{day} disc{disc_num} 完了")
     extract_co_from_scene(scene_text, day)
     print(filepath)
 
@@ -963,14 +1009,19 @@ def main() -> None:
     if args.backend == "claude":
         client  = init_claude()
         _call_fn = lambda p: call_claude(client, p)
+        call_fn_json = lambda p: call_claude_json(client, p)
         backend_label = f"Claude ({CLAUDE_MODEL_NAME})"
+        npc_model_label = CLAUDE_MODEL_NAME
     else:
         client  = init_gemini()
         _call_fn = lambda p: call_gemini(client, p)
-        backend_label = f"Gemini ({MODEL_NAME})"
+        call_fn_json = lambda p: call_gemini_json(client, p)
+        backend_label = f"Gemini (GM={GM_MODEL_NAME} / NPC={NPC_MODEL_NAME})"
+        npc_model_label = NPC_MODEL_NAME
 
-    # NPC エージェントに call_fn を渡す
-    _npc_agent.init(_call_fn)
+    # NPC エージェントに call_fn を渡す（JSON 専用関数・NPC モデル名も渡す）
+    _npc_agent.init(_call_fn, call_fn_json, npc_model_name=npc_model_label)
+    _npc_agent.write_debug_header(f"起動: {args.scene}  backend={backend_label}")
 
     state  = load_state()
     chars  = load_chars()

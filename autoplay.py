@@ -12,11 +12,25 @@ import json
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 MAX_DAYS    = 9   # 無限ループ防止
 REPORT_FILE = "autoplay_report.json"
+
+# レート制限リトライ設定（通常ウェイトは 0）
+# NOTE: "429" は数値として出力に紛れ込む可能性があるため除外し、
+#       より具体的なAPIエラー文字列のみで検知する
+_RATE_LIMIT_SIGNALS = [
+    "RESOURCE_EXHAUSTED",
+    "ResourceExhausted",
+    "quota exceeded",
+    "rate limit exceeded",
+    "Too Many Requests",
+]
+_RATE_LIMIT_WAIT_BASE = 30   # 初回待機秒数（リトライごとに +30s）
+_RATE_LIMIT_MAX_TRIES = 10   # 最大リトライ回数
 
 # ---------------------------------------------------------------------------
 # 投票シーン整合性チェック
@@ -109,8 +123,22 @@ def check_vote_consistency(
 # ---------------------------------------------------------------------------
 
 def run(cmd: list[str]) -> tuple[str, str]:
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    return r.stdout.strip(), r.stderr.strip()
+    """サブプロセス実行。レート制限検出時のみ待機リトライ（通常ウェイト 0）。"""
+    for attempt in range(1, _RATE_LIMIT_MAX_TRIES + 1):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        combined = r.stdout + r.stderr
+        if any(sig.lower() in combined.lower() for sig in _RATE_LIMIT_SIGNALS):
+            wait = _RATE_LIMIT_WAIT_BASE * attempt
+            tag  = cmd[-1] if cmd else "?"
+            print(
+                f"  [rate_limit] {tag} → {wait}s 待機後リトライ"
+                f" ({attempt}/{_RATE_LIMIT_MAX_TRIES})",
+                flush=True,
+            )
+            time.sleep(wait)
+            continue
+        return r.stdout.strip(), r.stderr.strip()
+    return "", f"[rate_limit] {_RATE_LIMIT_MAX_TRIES}回リトライ失敗: {cmd[-1]}"
 
 
 def parse_kv(text: str) -> dict[str, str]:
@@ -272,9 +300,11 @@ def run_game(game_num: int, verbose: bool = True) -> dict:
             # 疑惑スコア収集（議論終了後・vote_decide 前）
             run(["python3.11", "gemini_gm.py", "suspicion-json"])
 
-            # vote_decide 前に alive_names を取得（処刑後の状態では名前が消えるため）
+            # vote_decide 前に alive_names と game_state を保存
+            # （vote_decide が処刑を実行して状態を変えるため、vote scene 生成前に退避する）
             pre_vote_state = load_state()
             alive_names    = [p["name"] for p in pre_vote_state["players"] if p["alive"]]
+            pre_vote_state_json = Path("game_state.json").read_text(encoding="utf-8")
 
             # vote_decide を先に実行して実際の投票結果を取得
             vote_out, _ = run([
@@ -284,11 +314,15 @@ def run_game(game_num: int, verbose: bool = True) -> dict:
             vkv = parse_kv(vote_out)
             executed = vkv.get("EXECUTED", "?")
             note(f"処刑: {executed}  WIN={vkv.get('WIN', 'none')}")
+            post_vote_state_json = Path("game_state.json").read_text(encoding="utf-8")
 
             # 実際の投票結果を使って投票シーンを生成
+            # validator が「被処刑者は死亡済み」と判定しないよう、処刑前の状態に一時復元する
             npc_votes = parse_npc_votes(vote_out)
             votes_json = json.dumps(npc_votes, ensure_ascii=False)
+            Path("game_state.json").write_text(pre_vote_state_json, encoding="utf-8")
             out, err = run(["python3.11", "gemini_gm.py", "vote", "--votes", votes_json])
+            Path("game_state.json").write_text(post_vote_state_json, encoding="utf-8")
             if not out:
                 result["errors"].append(f"Day{day} vote 生成失敗\n{err[:200]}")
 
@@ -343,8 +377,19 @@ def run_game(game_num: int, verbose: bool = True) -> dict:
         run(["python3.11", "gemini_gm.py", "epilogue-thread"])
         note(f"epilogue 完了  勝者={result['winner']}")
 
+        # 論理破綻チェック（ゲーム終了後）
+        try:
+            final_state = load_state()
+            logic_failures = check_logic_failures(final_state, result["errors"])
+            result["logic_failures"] = logic_failures
+        except Exception as e2:
+            result["logic_failures"] = [
+                {"type": "CHECK_ERROR", "day": None, "detail": str(e2)}
+            ]
+
     except Exception as e:
         result["errors"].append(f"例外: {type(e).__name__}: {e}")
+        result.setdefault("logic_failures", [])
         if verbose:
             import traceback
             traceback.print_exc()
@@ -461,6 +506,67 @@ def check_consistency(result: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# 論理破綻チェック（ゲーム終了後）
+# ---------------------------------------------------------------------------
+
+def check_logic_failures(state: dict, errors: list[str]) -> list[dict]:
+    """論理破綻を検出し、タイプ別のリストで返す。
+
+    検出項目:
+      FRIENDLY_FIRE  : 人狼が人狼仲間に投票
+      DEAD_SPEECH    : 死亡者の発言（validator エラーから抽出）
+      DUPLICATE_SEER : 同一ターゲットへの重複占い
+      VOTE_MISMATCH  : 投票シーンと実投票ロジックの矛盾（VOTE_CHECK_ERROR）
+    """
+    failures: list[dict] = []
+    players  = state.get("players", [])
+    log      = state.get("log", [])
+    wolf_set = {p["name"] for p in players if p["role"] == "werewolf"}
+
+    # 1. 身内への誤爆: 人狼が人狼仲間に処刑投票
+    for e in log:
+        if e.get("type") != "execute":
+            continue
+        for voter, target in e.get("votes", {}).items():
+            if voter in wolf_set and target in wolf_set:
+                failures.append({
+                    "type":   "FRIENDLY_FIRE",
+                    "day":    e["day"],
+                    "detail": f"{voter}(人狼) が {target}(人狼) に投票",
+                })
+
+    # 2. 死人の発言: validator エラーから検出
+    _dead_kw = ["死亡者", "死人", "alive: false", "死んでいる", "DEAD"]
+    for err in errors:
+        if any(kw in err for kw in _dead_kw):
+            failures.append({
+                "type":   "DEAD_SPEECH",
+                "day":    None,
+                "detail": err[:120],
+            })
+
+    # 3. 重複占い
+    seer_targets = [e["target"] for e in log if e.get("type") == "seer"]
+    for t in {x for x in seer_targets if seer_targets.count(x) > 1}:
+        failures.append({
+            "type":   "DUPLICATE_SEER",
+            "day":    None,
+            "detail": f"{t} を複数回占い（{seer_targets.count(t)} 回）",
+        })
+
+    # 4. 投票シーンと実ロジックの矛盾（run_game が errors に VOTE_CHECK_ERROR として記録済み）
+    for err in errors:
+        if "VOTE_CHECK_ERROR" in err:
+            failures.append({
+                "type":   "VOTE_MISMATCH",
+                "day":    None,
+                "detail": err[:120],
+            })
+
+    return failures
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -496,7 +602,20 @@ def main() -> None:
             for e in result["errors"]:
                 print(f"    • {e[:120]}", flush=True)
 
-    # サマリー
+        # 論理破綻サマリー（ゲームごと）
+        logic_failures = result.get("logic_failures", [])
+        print(f"\n  ── 論理破綻チェック ({'%d件' % len(logic_failures) if logic_failures else '問題なし'}) ──", flush=True)
+        if logic_failures:
+            for lf in logic_failures:
+                day_str = f"Day{lf['day']} " if lf.get("day") else ""
+                print(f"    [{lf['type']}] {day_str}{lf['detail']}", flush=True)
+        else:
+            print("    FRIENDLY_FIRE  : 0件", flush=True)
+            print("    DEAD_SPEECH    : 0件", flush=True)
+            print("    DUPLICATE_SEER : 0件", flush=True)
+            print("    VOTE_MISMATCH  : 0件", flush=True)
+
+    # 全体サマリー
     print(f"\n{'='*64}")
     winners = [r.get("winner") for r in all_results]
     days    = [r.get("days", 0) for r in all_results]
@@ -504,6 +623,19 @@ def main() -> None:
     print(f"  勝利: 村人={winners.count('village')}  人狼={winners.count('werewolf')}  未決={winners.count(None)}")
     print(f"  平均日数: {sum(days)/len(days):.1f}  最大={max(days)}  最小={min(days)}")
     print(f"  整合性問題: 合計 {total_issues} 件  ({total_issues/args.runs:.1f} 件/ゲーム)")
+
+    # 論理破綻タイプ別集計
+    type_counts: dict[str, int] = {}
+    total_logic = 0
+    for r in all_results:
+        for lf in r.get("logic_failures", []):
+            type_counts[lf["type"]] = type_counts.get(lf["type"], 0) + 1
+            total_logic += 1
+    print(f"  論理破綻: 合計 {total_logic} 件  ({total_logic/args.runs:.1f} 件/ゲーム)")
+    for t in ["FRIENDLY_FIRE", "DEAD_SPEECH", "DUPLICATE_SEER", "VOTE_MISMATCH", "CHECK_ERROR"]:
+        cnt = type_counts.get(t, 0)
+        mark = "✓" if cnt == 0 else "⚠"
+        print(f"    {mark} {t:<20}: {cnt} 件")
     print(f"{'='*64}")
 
     # レポート保存
