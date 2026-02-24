@@ -268,7 +268,7 @@ def run_validator(filepath: str) -> tuple[bool, str]:
 # シーン生成（リトライ付き）
 # ---------------------------------------------------------------------------
 
-def generate_scene(client, filepath: str, prompt: str) -> bool:
+def generate_scene(client, filepath: str, prompt: str, prefix: str = "") -> bool:
     """Gemini でシーンを生成し validator を通す。最大 MAX_RETRIES 回リトライ。"""
     errors: str | None = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -282,6 +282,8 @@ def generate_scene(client, filepath: str, prompt: str) -> bool:
 
         print(f"[Gemini] 生成中... (試行 {attempt}/{MAX_RETRIES})", file=sys.stderr)
         text = call_gemini(client, retry_prompt)
+        if prefix:
+            text = prefix + "\n" + text
         Path(filepath).write_text(text, encoding="utf-8")
 
         ok, output = run_validator(filepath)
@@ -416,16 +418,29 @@ def cmd_morning(client, state: dict, chars: list, player: str) -> None:
         print(filepath)
 
 
-def cmd_discussion(client, state: dict, chars: list, player: str) -> None:
+def _load_prev_discs(day: int, disc_num: int) -> str:
+    """同日の disc1〜disc(N-1) の内容を読み込んで返す。"""
+    parts = []
+    for i in range(1, disc_num):
+        p = Path(f"scene_day{day}_disc{i}.txt")
+        if p.exists():
+            parts.append(f"=== disc{i} ===\n{p.read_text(encoding='utf-8')}")
+    if not parts:
+        return ""
+    return "## 本日の議論（これまでの流れ・必ず把握して続けること）\n" + "\n\n".join(parts)
+
+
+def cmd_discussion(client, state: dict, chars: list, player: str, context: str = "") -> None:
     day      = state["day"]
     brief    = run_discussion_brief()
     filepath = next_disc_file(day)
     disc_num = int(re.search(r"disc(\d+)", filepath).group(1))
 
-    alive_names   = [p["name"] for p in state["players"] if p["alive"]]
-    state_summary = build_state_summary(state, player)
-    char_info     = build_char_info(chars, alive_names)
+    alive_names    = [p["name"] for p in state["players"] if p["alive"]]
+    state_summary  = build_state_summary(state, player)
+    char_info      = build_char_info(chars, alive_names)
     co_instruction = build_co_instruction(state, player, brief, disc_num)
+    prev_discs     = _load_prev_discs(day, disc_num)
 
     brief_text = "\n".join(f"- {k}: {v}" for k, v in brief.items())
 
@@ -443,10 +458,13 @@ def cmd_discussion(client, state: dict, chars: list, player: str) -> None:
 
 {co_instruction}
 
-## タスク: Day {day} 議論シーン {disc_num} を生成してください
+{prev_discs}
 
+## タスク: Day {day} 議論シーン {disc_num} を生成してください
+{f"## プレイヤーの直前の発言（この直後からシーンを続けること）{chr(10)}{player}「{context}」{chr(10)}" if context else ""}
 生成ルール:
 - 生存者のみが発言する（死亡者は絶対に発言させない）
+- これまでの議論（上記）で出た情報・CO・発言を必ず踏まえて続けること
 - 確定黒 [{confirmed_black}] が存在する場合: 吊り最優先として議論を誘導する
 - 確定白 [{confirmed_white}] が存在する場合: 信頼できる存在として扱う
 - 村の多数派の投票予測 [{vote_plan}] を踏まえた議論にする
@@ -457,7 +475,8 @@ def cmd_discussion(client, state: dict, chars: list, player: str) -> None:
 
 出力: {filepath} のテキストのみ（余分な説明・コードブロック不要）\
 """
-    if generate_scene(client, filepath, prompt):
+    prefix = f'{player}「{context}」' if context else ""
+    if generate_scene(client, filepath, prompt, prefix=prefix):
         print(filepath)
 
 
@@ -620,6 +639,10 @@ def main() -> None:
         choices=["morning", "discussion", "vote", "execution", "epilogue", "epilogue-thread"],
         help="生成するシーンタイプ",
     )
+    parser.add_argument(
+        "--context", default="",
+        help="プレイヤーの直前の発言（discシーンに組み込まれる）",
+    )
     args = parser.parse_args()
 
     client = init_gemini()
@@ -635,7 +658,10 @@ def main() -> None:
         "epilogue":        cmd_epilogue,
         "epilogue-thread": cmd_epilogue_thread,
     }
-    dispatch[args.scene](client, state, chars, player)
+    if args.scene == "discussion":
+        cmd_discussion(client, state, chars, player, context=args.context)
+    else:
+        dispatch[args.scene](client, state, chars, player)
 
 
 if __name__ == "__main__":
