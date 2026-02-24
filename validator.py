@@ -78,6 +78,20 @@ def validate(game_state, narration_text, is_epilogue=False, executed_name=None):
                         f"[役職漏洩] {name}（{role}）のように役職が付記されています"
                     )
 
+    # フォーマット不正チェック: 名前重複・二重括弧パターン
+    for name in player_names:
+        # 名前「名前[：:] パターン（内部で名前が重複している）
+        dup_pattern = re.escape(name) + r"「" + re.escape(name) + r"[：:]"
+        if re.search(dup_pattern, narration_text):
+            errors.append(
+                f"[フォーマット不正] {name} の発言に名前重複パターン（{name}「{name}：）が検出されました"
+            )
+    # 二重かぎ括弧パターン
+    if re.search(r"「「", narration_text):
+        errors.append("[フォーマット不正] 二重開きかぎ括弧（「「）が検出されました")
+    if re.search(r"」」", narration_text):
+        errors.append("[フォーマット不正] 二重閉じかぎ括弧（」」）が検出されました")
+
     return errors
 
 

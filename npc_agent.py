@@ -253,6 +253,41 @@ def _build_npc_prompt(
 # メッセージフォーマット正規化
 # ---------------------------------------------------------------------------
 
+def _clean_inner_redundancy(npc_name: str, line: str) -> str:
+    """1行の 名前「...」 から内部の名前重複・余分な「」を除去する。
+
+    LLMが以下のパターンを生成することがあるため、それを正規化する：
+      名前「名前：「セリフ」」  → 名前「セリフ」   （名前+コロン+二重括弧）
+      名前「名前: セリフ」     → 名前「セリフ」   （名前+半角コロン+一重括弧）
+      名前「「セリフ」」       → 名前「セリフ」   （余分な開き括弧）
+    """
+    s = line.strip()
+    prefix = f'{npc_name}「'
+    if not s.startswith(prefix):
+        return line
+
+    inner = s[len(prefix):]
+    # 末尾の余分な 」を全て剥がす（後で 1つ付け直す）
+    while inner.endswith('」'):
+        inner = inner[:-1]
+
+    # パターン1: 名前[：:]\s*「セリフ」  （二重名前 + 二重括弧）
+    m = re.match(rf'^{re.escape(npc_name)}[：:]\s*「([\s\S]*?)」?\s*$', inner)
+    if m:
+        return f'{npc_name}「{m.group(1).rstrip("」")}」'
+
+    # パターン2: 名前[：:]\s*セリフ  （二重名前 + 括弧なし）
+    m = re.match(rf'^{re.escape(npc_name)}[：:]\s*([\s\S]+)$', inner)
+    if m:
+        return f'{npc_name}「{m.group(1)}」'
+
+    # パターン3: 先頭の余分な「
+    if inner.startswith('「'):
+        inner = inner[1:]
+
+    return f'{npc_name}「{inner}」'
+
+
 def _normalize_message(npc_name: str, message: str) -> str:
     """メッセージを '名前「セリフ」' 形式（1行1発言）に正規化する。
 
@@ -301,6 +336,9 @@ def _normalize_message(npc_name: str, message: str) -> str:
             result.append(f'{npc_name}「{stripped}」')
 
     flush_block()  # 閉じ忘れ処理
+
+    # 後処理: 内部の名前重複・余分な「」を除去
+    result = [_clean_inner_redundancy(npc_name, r) for r in result]
 
     return '\n'.join(result) if result else message
 
