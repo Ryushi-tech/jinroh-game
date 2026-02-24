@@ -1,3 +1,6 @@
 chara_image/
 scene_*.txt
 .env
+__pycache__/
+*.pyc
+.pytest_cache/
