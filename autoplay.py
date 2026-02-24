@@ -18,6 +18,91 @@ from pathlib import Path
 MAX_DAYS    = 9   # 無限ループ防止
 REPORT_FILE = "autoplay_report.json"
 
+# ---------------------------------------------------------------------------
+# 投票シーン整合性チェック
+# ---------------------------------------------------------------------------
+
+# 「{name}[さん君殿]?に投票」「{name}[さん君殿]?に一票」「{name}[さん君殿]?を処刑/吊」など
+_VOTE_SUFFIX = r'(?:さん|君|殿|様)?'
+_VOTE_PHRASES = [
+    r'に投票',
+    r'に一票',
+    r'に入れ',
+    r'を処刑',
+    r'を吊',
+    r'吊り',   # 「ディータ吊りで」のような形
+]
+
+
+def _extract_vote_target(dialogue: str, candidate_names: list[str]) -> str | None:
+    """セリフ文字列から投票先の名前を抽出する。見つからなければ None。"""
+    for name in candidate_names:
+        escaped = re.escape(name)
+        for phrase in _VOTE_PHRASES:
+            if re.search(f'{escaped}{_VOTE_SUFFIX}{phrase}', dialogue):
+                return name
+    return None
+
+
+def check_vote_consistency(
+    scene_path: str,
+    npc_votes: dict,
+    player: str,
+    alive_names: list[str],
+) -> list[str]:
+    """vote scene のセリフと npc_votes の投票先を突き合わせる。
+
+    Returns:
+        不一致・読取不能の場合はメッセージのリスト（整合していれば空リスト）。
+        VOTE_CHECK_ERROR: セリフが logic と矛盾（最重要）
+        VOTE_CHECK_WARN:  セリフから投票先を読み取れなかった（確認推奨）
+    """
+    issues: list[str] = []
+
+    try:
+        with open(scene_path, encoding="utf-8") as f:
+            raw_lines = f.readlines()
+    except OSError as e:
+        return [f"VOTE_CHECK_ERR: シーンファイルを開けない {scene_path}: {e}"]
+
+    # スピーカー別に全セリフを結合（1NPCが複数行ある場合も対応）
+    speaker_dialogues: dict[str, list[str]] = {}
+    for line in raw_lines:
+        m = re.match(r'^(.+?)「(.+)」\s*$', line.strip())
+        if m:
+            speaker  = m.group(1).strip()
+            dialogue = m.group(2).strip()
+            speaker_dialogues.setdefault(speaker, []).append(dialogue)
+
+    for npc, info in npc_votes.items():
+        if npc == player:
+            continue
+        expected  = info["target"] if isinstance(info, dict) else str(info)
+        dialogues = speaker_dialogues.get(npc, [])
+
+        if not dialogues:
+            issues.append(
+                f"VOTE_CHECK_WARN: {npc} のセリフが scene に見つからない "
+                f"(expected={expected})"
+            )
+            continue
+
+        combined  = " ".join(dialogues)
+        extracted = _extract_vote_target(combined, alive_names)
+
+        if extracted is None:
+            issues.append(
+                f"VOTE_CHECK_WARN: {npc} のセリフから投票先を読み取れず "
+                f"(expected={expected}) | {combined[:80]!r}"
+            )
+        elif extracted != expected:
+            issues.append(
+                f"VOTE_CHECK_ERROR: {npc} セリフ={extracted} vs logic={expected} [矛盾] "
+                f"| {combined[:80]!r}"
+            )
+
+    return issues
+
 
 # ---------------------------------------------------------------------------
 # ユーティリティ
@@ -187,6 +272,10 @@ def run_game(game_num: int, verbose: bool = True) -> dict:
             # 疑惑スコア収集（議論終了後・vote_decide 前）
             run(["python3.11", "gemini_gm.py", "suspicion-json"])
 
+            # vote_decide 前に alive_names を取得（処刑後の状態では名前が消えるため）
+            pre_vote_state = load_state()
+            alive_names    = [p["name"] for p in pre_vote_state["players"] if p["alive"]]
+
             # vote_decide を先に実行して実際の投票結果を取得
             vote_out, _ = run([
                 "python3.11", "gm_helper.py", "vote_decide",
@@ -202,6 +291,17 @@ def run_game(game_num: int, verbose: bool = True) -> dict:
             out, err = run(["python3.11", "gemini_gm.py", "vote", "--votes", votes_json])
             if not out:
                 result["errors"].append(f"Day{day} vote 生成失敗\n{err[:200]}")
+
+            # 投票シーン整合性チェック
+            if out:
+                pname = player_name()
+                vote_issues = check_vote_consistency(
+                    out, npc_votes, pname, alive_names,
+                )
+                for issue in vote_issues:
+                    note(issue)
+                    if "ERROR" in issue:
+                        result["errors"].append(issue)
 
             # 処刑シーン
             out, err = run(["python3.11", "gemini_gm.py", "execution"])
