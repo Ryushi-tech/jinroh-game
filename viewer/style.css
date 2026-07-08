@@ -70,6 +70,24 @@ header {
   letter-spacing: 0.1em;
 }
 
+.header-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-dim);
+  padding: 4px 12px;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  margin-right: 10px;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.header-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+
 .live-dot {
   display: inline-block;
   width: 8px;
@@ -92,7 +110,111 @@ header {
 /* ── Layout ── */
 #app {
   display: flex;
-  height: calc(100vh - 48px);
+  height: calc(100vh - 48px - 76px);
+}
+
+/* ── Action bar ── */
+#action-bar {
+  height: 76px;
+  background: var(--bg-header);
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  padding: 0 24px;
+  flex-shrink: 0;
+}
+
+#action-inner {
+  max-width: 900px;
+  margin: 0 auto;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+#action-status {
+  font-size: 12px;
+  color: var(--text-dim);
+  min-height: 16px;
+  letter-spacing: 0.05em;
+}
+
+#action-status.error {
+  color: var(--dead);
+}
+
+#action-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+#action-controls input[type="text"] {
+  flex: 1;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-bright);
+  padding: 9px 14px;
+  font-family: inherit;
+  font-size: 14px;
+  outline: none;
+}
+
+#action-controls input[type="text"]:focus {
+  border-color: var(--accent-dim);
+}
+
+#action-controls select {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-bright);
+  padding: 9px 12px;
+  font-family: inherit;
+  font-size: 14px;
+  outline: none;
+}
+
+.action-btn {
+  background: var(--accent-dim);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--text-bright);
+  padding: 9px 18px;
+  font-family: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s ease;
+}
+
+.action-btn:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--bg-deep);
+}
+
+.action-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.action-btn.secondary {
+  background: var(--bg-card);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.action-btn.secondary:hover:not(:disabled) {
+  background: var(--border);
+  color: var(--text-bright);
+}
+
+.action-note {
+  font-size: 13px;
+  color: var(--text-dim);
+  font-style: italic;
 }
 
 /* ── Sidebar ── */

@@ -4,3 +4,8 @@ scene_*.txt
 __pycache__/
 *.pyc
 .pytest_cache/
+logs/
+.typing_now
+.player_name
+.gm_notes.json
+game_state.json

@@ -40,6 +40,11 @@
   const $privateList = document.getElementById("private-list");
   const $scenes = document.getElementById("scenes");
   const $main = document.getElementById("main");
+  const $actionStatus = document.getElementById("action-status");
+  const $actionControls = document.getElementById("action-controls");
+
+  let actionPending = false;   // POST 送信中
+  let lastUiKey = null;        // アクションUIの再構築判定用
 
   // ── Scroll tracking ──
   $main.addEventListener("scroll", function () {
@@ -69,6 +74,216 @@
     return fetch(url).then(function (res) {
       if (!res.ok) throw new Error(res.status + " " + res.statusText);
       return res.json();
+    });
+  }
+
+  function postJSON(url, body) {
+    return fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    }).then(function (res) {
+      return res.json().then(function (data) {
+        if (!res.ok) throw new Error(data.error || (res.status + " " + res.statusText));
+        return data;
+      });
+    });
+  }
+
+  // ── Action bar ──
+  function setStatus(text, isError) {
+    $actionStatus.textContent = text || "";
+    $actionStatus.className = isError ? "error" : "";
+  }
+
+  function sendAction(url, body, pendingText) {
+    if (actionPending) return;
+    actionPending = true;
+    setStatus(pendingText || "処理中…（NPCが考えています）");
+    setControlsDisabled(true);
+    isTyping = true;
+
+    postJSON(url, body)
+      .then(function (data) {
+        setStatus("");
+        if (data.seer_result) {
+          var r = data.seer_result.result === "werewolf" ? "人狼" : "人狼ではない";
+          setStatus("占い結果: " + data.seer_result.target + " は " + r);
+        }
+      })
+      .catch(function (err) {
+        setStatus(err.message, true);
+      })
+      .finally(function () {
+        actionPending = false;
+        lastUiKey = null;  // UI再構築を強制
+        update().catch(function () {});
+      });
+  }
+
+  function setControlsDisabled(disabled) {
+    var elems = $actionControls.querySelectorAll("input, select, button");
+    for (var i = 0; i < elems.length; i++) elems[i].disabled = disabled;
+  }
+
+  function el(tag, attrs, text) {
+    var e = document.createElement(tag);
+    if (attrs) Object.keys(attrs).forEach(function (k) { e.setAttribute(k, attrs[k]); });
+    if (text) e.textContent = text;
+    return e;
+  }
+
+  function makeSelect(options, placeholder) {
+    var sel = el("select");
+    if (placeholder) {
+      var ph = el("option", { value: "" }, placeholder);
+      ph.disabled = true;
+      ph.selected = true;
+      sel.appendChild(ph);
+    }
+    options.forEach(function (name) {
+      sel.appendChild(el("option", { value: name }, name));
+    });
+    return sel;
+  }
+
+  function makeButton(label, onClick, secondary) {
+    var btn = el("button", { class: "action-btn" + (secondary ? " secondary" : "") }, label);
+    btn.addEventListener("click", onClick);
+    return btn;
+  }
+
+  function renderActionBar(state) {
+    var ui = state.ui || { mode: "unknown" };
+    var busy = state.busy || actionPending;
+    // busy 中は既存UIを無効化するだけで再構築しない（入力内容を保持）
+    var uiKey = ui.mode + ":" + (ui.need || "") + ":" + state.day + ":" + state.phase;
+    if (uiKey === lastUiKey) {
+      setControlsDisabled(busy);
+      return;
+    }
+    lastUiKey = uiKey;
+    $actionControls.innerHTML = "";
+
+    if (ui.mode === "setup") {
+      var charSel = makeSelect(ui.characters || [], "キャラクターを選択");
+      var startBtn = makeButton("新しいゲームを開始", function () {
+        if (!charSel.value) { setStatus("キャラクターを選んでください", true); return; }
+        sendAction("/api/new_game", { player: charSel.value }, "ゲームを準備しています…");
+      });
+      $actionControls.appendChild(charSel);
+      $actionControls.appendChild(startBtn);
+      setStatus("プレイするキャラクターを選んでゲームを開始してください");
+
+    } else if (ui.mode === "discussion") {
+      if (ui.can_speak) {
+        var input = el("input", { type: "text", placeholder: "発言する（Enterで送信）" });
+        var sayBtn = makeButton("発言", function () { submitSay(); });
+        var voteSel = makeSelect(ui.vote_candidates || [], "投票先…");
+        var voteBtn = makeButton("投票へ", function () {
+          if (!voteSel.value) { setStatus("投票先を選んでください", true); return; }
+          sendAction("/api/vote", { target: voteSel.value }, "投票を集計しています…");
+        }, true);
+
+        function submitSay() {
+          var msg = input.value.trim();
+          if (!msg) { setStatus("発言内容を入力してください", true); return; }
+          input.value = "";
+          sendAction("/api/say", { message: msg }, "NPCが応答しています…");
+        }
+        input.addEventListener("keydown", function (e) {
+          if (e.key === "Enter" && !e.isComposing) submitSay();
+        });
+
+        $actionControls.appendChild(input);
+        $actionControls.appendChild(sayBtn);
+        $actionControls.appendChild(voteSel);
+        $actionControls.appendChild(voteBtn);
+        setStatus("");
+      } else {
+        var contBtn = makeButton("議論を見守る（次のラウンドへ）", function () {
+          sendAction("/api/continue", {}, "NPCが議論しています…");
+        });
+        var skipBtn = makeButton("投票へ進む", function () {
+          sendAction("/api/vote", {}, "投票を集計しています…");
+        }, true);
+        $actionControls.appendChild(contBtn);
+        $actionControls.appendChild(skipBtn);
+        setStatus("あなたは死亡しています。議論を見守りましょう");
+      }
+
+    } else if (ui.mode === "vote") {
+      if (ui.can_vote) {
+        var vSel = makeSelect(ui.vote_candidates || [], "投票先…");
+        var vBtn = makeButton("投票する", function () {
+          if (!vSel.value) { setStatus("投票先を選んでください", true); return; }
+          sendAction("/api/vote", { target: vSel.value }, "投票を集計しています…");
+        });
+        $actionControls.appendChild(vSel);
+        $actionControls.appendChild(vBtn);
+      } else {
+        $actionControls.appendChild(makeButton("開票する", function () {
+          sendAction("/api/vote", {}, "投票を集計しています…");
+        }));
+      }
+      setStatus("投票フェーズです");
+
+    } else if (ui.mode === "night") {
+      var labels = { seer: "占う相手", guard: "護衛する相手", attack: "襲撃する相手" };
+      if (ui.need) {
+        var nSel = makeSelect(ui.candidates || [], labels[ui.need] + "…");
+        var nBtn = makeButton("決定", function () {
+          if (!nSel.value) { setStatus("対象を選んでください", true); return; }
+          var body = {};
+          body[ui.need] = nSel.value;
+          sendAction("/api/night_action", body, "夜が更けていきます…");
+        });
+        $actionControls.appendChild(el("span", { class: "action-note" },
+          "夜になりました。" + labels[ui.need] + "を選んでください"));
+        $actionControls.appendChild(nSel);
+        $actionControls.appendChild(nBtn);
+        setStatus("");
+      } else {
+        $actionControls.appendChild(makeButton("夜を明かす", function () {
+          sendAction("/api/night_action", {}, "夜が更けていきます…");
+        }));
+        setStatus("夜になりました。あなたにできることはありません");
+      }
+
+    } else if (ui.mode === "epilogue_pending") {
+      $actionControls.appendChild(el("span", { class: "action-note" },
+        "決着がつきました。エピローグを生成しています…"));
+
+    } else if (ui.mode === "game_over") {
+      $actionControls.appendChild(el("span", { class: "action-note" }, "ゲーム終了"));
+      $actionControls.appendChild(makeButton("新しいゲームを始める", function () {
+        lastUiKey = null;
+        renderSetupForRestart();
+      }, true));
+      setStatus("全役職が公開されました。お疲れさまでした");
+    } else {
+      setStatus("");
+    }
+
+    setControlsDisabled(busy);
+  }
+
+  function renderSetupForRestart() {
+    $actionControls.innerHTML = "";
+    fetchJSON("/api/characters").then(function (chars) {
+      var names = Object.keys(chars);
+      var charSel = makeSelect(names, "キャラクターを選択");
+      var startBtn = makeButton("新しいゲームを開始", function () {
+        if (!charSel.value) { setStatus("キャラクターを選んでください", true); return; }
+        // 旧シーン表示をクリア
+        loadedScenes = new Set();
+        sceneDivs = {};
+        $scenes.innerHTML = "";
+        sendAction("/api/new_game", { player: charSel.value }, "ゲームを準備しています…");
+      });
+      $actionControls.appendChild(charSel);
+      $actionControls.appendChild(startBtn);
+      setStatus("プレイするキャラクターを選んでください");
     });
   }
 
@@ -234,6 +449,15 @@
 
   // ── Scene loading（差分更新対応）──
   function loadScenes(sceneList, activeScene) {
+    // サーバー側で削除されたシーン（新規ゲーム開始時）をDOMから除去
+    Object.keys(sceneDivs).forEach(function (name) {
+      if (sceneList.indexOf(name) === -1) {
+        sceneDivs[name].remove();
+        delete sceneDivs[name];
+        loadedScenes.delete(name);
+      }
+    });
+
     // 未ロードのシーン ＋ アクティブ（生成中）シーンを再取得対象にする
     var newScenes = sceneList.filter(function (name) {
       return !loadedScenes.has(name);
@@ -309,10 +533,11 @@
       fetchJSON("/api/typing").catch(function () { return null; }),
     ]).then(function (results) {
       var typingData = results[2];
-      isTyping = !!(typingData && typingData.npc);
-      var activeScene = isTyping ? typingData.scene : null;
+      isTyping = !!(typingData && (typingData.npc || typingData.busy)) || actionPending;
+      var activeScene = (typingData && typingData.scene) ? typingData.scene : null;
 
       renderSidebar(results[0]);
+      renderActionBar(results[0]);
       // シーン更新が完了してからタイピングインジケータを末尾に表示
       return loadScenes(results[1], activeScene).then(function () {
         renderTypingIndicator(typingData);
@@ -322,6 +547,16 @@
 
   // ── Init ──
   function init() {
+    var $newGameBtn = document.getElementById("new-game-btn");
+    if ($newGameBtn) {
+      $newGameBtn.addEventListener("click", function () {
+        if (actionPending) return;
+        if (!confirm("進行中のゲームを破棄して新規ゲームを始めますか？")) return;
+        lastUiKey = null;
+        renderSetupForRestart();
+      });
+    }
+
     fetchJSON("/api/characters")
       .then(function (data) { charDescriptions = data; })
       .catch(function () { /* ok */ })

@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
-"""人狼ゲーム 表示専用Webビューア — HTTPサーバー
+"""人狼ゲーム Webサーバー（表示 + 対話）
 
 Usage: python3 viewer/server.py [--port PORT]
 
-標準ライブラリのみ使用。localhost:8080 でビューアを配信する。
+GET  (表示系・従来どおり):
+    /api/state /api/scenes /api/scene/<name> /api/typing /api/hash /api/characters
+
+POST (対話系・ゲーム進行):
+    /api/new_game      {"player": "オットー"}     新規ゲーム開始
+    /api/say           {"message": "..."}          発言して議論ラウンドを回す
+    /api/continue      {}                          発言せず議論ラウンドを回す（死亡時等）
+    /api/vote          {"target": "ヤコブ"}        投票を締め切り処刑まで進める
+    /api/night_action  {"seer"|"guard"|"attack": 名前}  夜行動（不要な役職は空JSON）
+
+進行中のPOSTは1件のみ受け付ける（409 busy）。フロントは /api/typing と
+/api/hash のポーリングで生成中表示・画面更新を行う。
 """
 
 import hashlib
@@ -11,17 +22,24 @@ import json
 import os
 import re
 import sys
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import unquote
 
 # プロジェクトルート（viewer/ の親ディレクトリ）
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
+
 VIEWER_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(PROJECT_ROOT, "game_state.json")
 CHARACTERS_FILE = os.path.join(PROJECT_ROOT, "characters.json")
 PLAYER_NAME_FILE = os.path.join(PROJECT_ROOT, ".player_name")
 CHARA_IMAGE_DIR = os.path.join(PROJECT_ROOT, "chara_image")
 TYPING_FILE = os.path.join(PROJECT_ROOT, ".typing_now")
+
+import engine
+from engine import GameError
+from orchestrator import Orchestrator, OrchestratorError
 
 ROLE_JP = {
     "villager": "村人",
@@ -50,6 +68,19 @@ CONTENT_TYPES = {
     ".webp": "image/webp",
 }
 
+# ゲーム進行の排他制御
+_game_lock = threading.Lock()
+_orchestrator: Orchestrator | None = None
+_orchestrator_lock = threading.Lock()
+
+
+def get_orchestrator() -> Orchestrator:
+    global _orchestrator
+    with _orchestrator_lock:
+        if _orchestrator is None:
+            _orchestrator = Orchestrator()
+        return _orchestrator
+
 
 def load_json(path):
     with open(path, encoding="utf-8") as f:
@@ -72,10 +103,7 @@ def get_player(state, name):
 
 
 def public_death_info(state):
-    """公開情報としての死亡者リスト。
-    処刑者: 霊媒結果は霊媒師のCOによってのみ公開されるため、陣営は非表示。
-    襲撃死者: 人狼に喰われた＝人狼ではないことが確定（「人間」と表示）。
-    """
+    """公開情報としての死亡者リスト。"""
     deaths = []
     for entry in state["log"]:
         if entry["type"] == "execute":
@@ -95,7 +123,7 @@ def public_death_info(state):
 
 
 def private_info(state, player):
-    """player_status.py と同等の役職固有秘密情報。"""
+    """役職固有の秘密情報（プレイヤー本人にのみ返す）。"""
     role = player["role"]
     info = []
 
@@ -146,47 +174,108 @@ def private_info(state, player):
 
 
 def is_game_over():
-    """エピローグシーンが存在すればゲーム終了とみなす。"""
     for fname in os.listdir(PROJECT_ROOT):
         if fname.startswith("scene_epilogue") and fname.endswith(".txt"):
             return True
     return False
 
 
+def _ui_hint(state, player, game_over):
+    """フロントが表示すべき入力UIの種類を返す。"""
+    if game_over:
+        return {"mode": "game_over"}
+    if state is None or player is None:
+        return {"mode": "setup", "characters": engine.ALL_NAMES}
+
+    phase = state["phase"]
+    player_alive = player["alive"]
+    win = engine.win_status(state)
+    if win != "none":
+        return {"mode": "epilogue_pending", "winner": win}
+
+    if phase == "day_discussion":
+        alive_names = [p["name"] for p in state["players"]
+                       if p["alive"] and p["name"] != player["name"]]
+        return {
+            "mode": "discussion",
+            "can_speak": player_alive,
+            "vote_candidates": alive_names if player_alive else [],
+        }
+    if phase == "day_vote":
+        alive_names = [p["name"] for p in state["players"]
+                       if p["alive"] and p["name"] != player["name"]]
+        return {
+            "mode": "vote",
+            "can_vote": player_alive,
+            "vote_candidates": alive_names if player_alive else [],
+        }
+    if phase == "night":
+        req = engine.night_requirements()
+        need = None
+        candidates = []
+        alive_others = [p["name"] for p in state["players"]
+                        if p["alive"] and p["name"] != player["name"]]
+        if req["seer"]:
+            need = "seer"
+            already = {e["target"] for e in state["log"] if e["type"] == "seer"}
+            candidates = [n for n in alive_others if n not in already] or alive_others
+        elif req["guard"]:
+            need = "guard"
+            prev = engine.last_guard_target(state)
+            candidates = [n for n in alive_others if n != prev]
+        elif req["attack"]:
+            need = "attack"
+            wolf_names = {p["name"] for p in state["players"] if p["role"] == "werewolf"}
+            candidates = [n for n in alive_others if n not in wolf_names]
+        return {
+            "mode": "night",
+            "need": need,
+            "candidates": candidates,
+        }
+    return {"mode": "unknown", "phase": phase}
+
+
 def build_filtered_state():
     """プレイヤー視点でフィルタしたゲーム状態を返す。"""
-    state = load_json(STATE_FILE)
+    try:
+        state = load_json(STATE_FILE)
+    except (FileNotFoundError, json.JSONDecodeError):
+        state = None
+
     player_name = get_player_name()
-    player = get_player(state, player_name) if player_name else None
+    player = get_player(state, player_name) if (state and player_name) else None
     game_over = is_game_over()
 
     alive = []
-    for p in state["players"]:
-        if p["alive"]:
-            entry = {"name": p["name"]}
-            if game_over:
-                entry["role"] = p["role"]
-                entry["role_jp"] = ROLE_JP.get(p["role"], p["role"])
-            alive.append(entry)
+    deaths = []
+    if state:
+        for p in state["players"]:
+            if p["alive"]:
+                entry = {"name": p["name"]}
+                if game_over:
+                    entry["role"] = p["role"]
+                    entry["role_jp"] = ROLE_JP.get(p["role"], p["role"])
+                alive.append(entry)
 
-    deaths = public_death_info(state)
-    if game_over:
-        # ゲーム終了後: 死者にも具体的な役職を付与
-        for d in deaths:
-            target = get_player(state, d["name"])
-            if target:
-                d["role"] = target["role"]
-                d["role_jp"] = ROLE_JP.get(target["role"], target["role"])
+        deaths = public_death_info(state)
+        if game_over:
+            for d in deaths:
+                target = get_player(state, d["name"])
+                if target:
+                    d["role"] = target["role"]
+                    d["role_jp"] = ROLE_JP.get(target["role"], target["role"])
 
     result = {
-        "day": state["day"],
-        "phase": state["phase"],
-        "phase_jp": PHASE_JP.get(state["phase"], state["phase"]),
+        "day": state["day"] if state else 0,
+        "phase": state["phase"] if state else "none",
+        "phase_jp": PHASE_JP.get(state["phase"], state["phase"]) if state else "--",
         "game_over": game_over,
         "player": None,
         "alive": alive,
         "deaths": deaths,
         "private_info": [],
+        "busy": _game_lock.locked(),
+        "ui": _ui_hint(state, player, game_over),
     }
 
     if player:
@@ -202,9 +291,6 @@ def build_filtered_state():
 
 
 def list_scene_files():
-    """scene_day* と scene_epilogue* のファイル名を時系列順で返す。
-    scene_night* は GM 視点情報が含まれるため除外。
-    """
     files = []
     for fname in os.listdir(PROJECT_ROOT):
         if not fname.endswith(".txt"):
@@ -216,13 +302,10 @@ def list_scene_files():
 
 
 def _scene_sort_key(fname):
-    """シーンファイルをゲーム内時系列順にソートするキー。"""
-    # scene_epilogue は最後（epilogue.txt → epilogue_thread.txt の順）
     if fname.startswith("scene_epilogue"):
         order = 1 if "_thread" in fname else 0
         return (999, order, "")
 
-    # scene_dayN_xxx.txt からday番号とフェーズ名を抽出
     m = re.match(r"scene_day(\d+)(?:_(.+))?\.txt", fname)
     if not m:
         return (0, 0, fname)
@@ -230,13 +313,11 @@ def _scene_sort_key(fname):
     day = int(m.group(1))
     phase = m.group(2) or ""
 
-    # フェーズの順序
     phase_order = {
         "morning": 0,
         "discussion": 1,
     }
 
-    # disc1, disc2, ... のパターン
     disc_match = re.match(r"disc(\d+)", phase)
     if disc_match:
         order = 10 + int(disc_match.group(1))
@@ -249,7 +330,6 @@ def _scene_sort_key(fname):
     elif phase.startswith("final"):
         order = 70
     elif phase == "":
-        # scene_dayN.txt (フェーズ名なし) — 日冒頭として扱う
         order = 5
     else:
         order = 30
@@ -257,8 +337,6 @@ def _scene_sort_key(fname):
 
 
 def read_scene_file(name):
-    """シーンファイル本文を読み取る。名前を検証してパストラバーサルを防止。"""
-    # ファイル名バリデーション
     if not re.match(r"^scene_(day\d+(_\w+)?|epilogue\w*)\.txt$", name):
         return None
     path = os.path.join(PROJECT_ROOT, name)
@@ -269,7 +347,6 @@ def read_scene_file(name):
 
 
 def compute_hash():
-    """変更検知用ハッシュ。state mtime + typing mtime + scene ファイル一覧。"""
     h = hashlib.md5()
     try:
         mtime = os.path.getmtime(STATE_FILE)
@@ -280,10 +357,10 @@ def compute_hash():
         h.update(str(os.path.getmtime(TYPING_FILE)).encode())
     except OSError:
         pass
+    h.update(b"busy" if _game_lock.locked() else b"idle")
 
     scenes = list_scene_files()
     h.update(json.dumps(scenes).encode())
-    # 各シーンファイルの mtime も含める
     for s in scenes:
         try:
             mt = os.path.getmtime(os.path.join(PROJECT_ROOT, s))
@@ -293,11 +370,95 @@ def compute_hash():
     return h.hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# ゲーム進行アクション
+# ---------------------------------------------------------------------------
+
+def _finish_if_won(orch, win: str) -> dict | None:
+    if win in ("village", "werewolf"):
+        return orch.epilogue(win)
+    return None
+
+
+def action_new_game(body: dict) -> dict:
+    orch = get_orchestrator()
+    info = orch.new_game(body.get("player"))
+    orch.morning_scene()
+    return {"ok": True, "setup": info}
+
+
+def action_say(body: dict) -> dict:
+    message = (body.get("message") or "").strip()
+    if not message:
+        raise GameError("発言内容が空です")
+    orch = get_orchestrator()
+    result = orch.discussion_round(message)
+    return {"ok": True, **result}
+
+
+def action_continue(body: dict) -> dict:
+    """発言せずに議論ラウンドを回す（プレイヤー死亡時・様子見）。"""
+    orch = get_orchestrator()
+    result = orch.discussion_round(None)
+    return {"ok": True, **result}
+
+
+def action_vote(body: dict) -> dict:
+    orch = get_orchestrator()
+    state = engine.load_state()
+    player = engine.player_name()
+    player_alive = any(p["name"] == player and p["alive"] for p in state["players"])
+
+    target = body.get("target")
+    if player_alive and not target:
+        raise GameError("投票先が必要です")
+
+    # 議論を締める前に疑惑スコアを収集（NPC投票・夜行動の判断材料）
+    orch.collect_suspicion()
+
+    result = orch.vote_and_execute(target if player_alive else None)
+    epilogue = _finish_if_won(orch, result["win"])
+    resp = {"ok": True, **result}
+    if epilogue:
+        resp["epilogue"] = epilogue
+    return resp
+
+
+def action_night(body: dict) -> dict:
+    orch = get_orchestrator()
+    result = orch.resolve_night(
+        seer=body.get("seer"),
+        guard=body.get("guard"),
+        attack=body.get("attack"),
+    )
+    epilogue = _finish_if_won(orch, result["win"])
+    resp = {"ok": True, **{k: v for k, v in result.items() if k != "seer_result"}}
+    if result.get("seer_result"):
+        resp["seer_result"] = result["seer_result"]
+    if epilogue:
+        resp["epilogue"] = epilogue
+    else:
+        orch.morning_scene()
+    return resp
+
+
+POST_ACTIONS = {
+    "/api/new_game": action_new_game,
+    "/api/say": action_say,
+    "/api/continue": action_continue,
+    "/api/vote": action_vote,
+    "/api/night_action": action_night,
+}
+
+
+# ---------------------------------------------------------------------------
+# HTTPハンドラ
+# ---------------------------------------------------------------------------
+
 class ViewerHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = unquote(self.path).split("?")[0]
 
-        # API エンドポイント
         if path == "/api/state":
             self._json_response(build_filtered_state())
         elif path == "/api/scenes":
@@ -313,15 +474,16 @@ class ViewerHandler(BaseHTTPRequestHandler):
             try:
                 with open(TYPING_FILE, encoding="utf-8") as f:
                     data = json.load(f)
+                data["busy"] = _game_lock.locked()
                 self._json_response(data)
             except (FileNotFoundError, json.JSONDecodeError):
-                self._json_response({"npc": None, "scene": None})
+                self._json_response({"npc": None, "scene": None,
+                                     "busy": _game_lock.locked()})
         elif path == "/api/hash":
             self._json_response({"hash": compute_hash()})
         elif path == "/api/characters":
             try:
                 chars = load_json(CHARACTERS_FILE)
-                # raw_description のみ返す（設定詳細は秘匿）
                 result = {}
                 for c in chars:
                     result[c["name"]] = c.get("raw_description", "")
@@ -331,8 +493,36 @@ class ViewerHandler(BaseHTTPRequestHandler):
         elif path.startswith("/chara_image/"):
             self._serve_chara_image(path)
         else:
-            # 静的ファイル配信
             self._serve_static(path)
+
+    def do_POST(self):
+        path = unquote(self.path).split("?")[0]
+        action = POST_ACTIONS.get(path)
+        if action is None:
+            self._error(404, "Unknown action")
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+        except json.JSONDecodeError:
+            self._error(400, "Invalid JSON body")
+            return
+
+        if not _game_lock.acquire(blocking=False):
+            self._error(409, "処理中です。完了までお待ちください")
+            return
+        try:
+            result = action(body)
+            self._json_response(result)
+        except (GameError, OrchestratorError) as e:
+            self._error(400, str(e))
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._error(500, f"内部エラー: {e}")
+        finally:
+            _game_lock.release()
 
     def _json_response(self, data):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -346,7 +536,6 @@ class ViewerHandler(BaseHTTPRequestHandler):
     def _serve_static(self, path):
         if path == "/":
             path = "/index.html"
-        # viewer ディレクトリ内のファイルのみ配信
         safe_path = os.path.normpath(path.lstrip("/"))
         if ".." in safe_path:
             self._error(403, "Forbidden")
@@ -366,9 +555,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _serve_chara_image(self, path):
-        """chara_image/ ディレクトリから画像を配信。"""
         fname = path[len("/chara_image/"):]
-        # ファイル名バリデーション（日本語文字 + 拡張子のみ許可）
         if not re.match(r"^[\w\u3000-\u9fff\uff00-\uffef]+\.(png|jpg|jpeg|webp)$", fname):
             self._error(404, "Not found")
             return
@@ -397,7 +584,8 @@ class ViewerHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         # API ポーリングのログを抑制
-        if "/api/hash" in (args[0] if args else ""):
+        first = args[0] if args else ""
+        if isinstance(first, str) and ("/api/hash" in first or "/api/typing" in first):
             return
         super().log_message(format, *args)
 
@@ -409,8 +597,8 @@ def main():
         if idx + 1 < len(sys.argv):
             port = int(sys.argv[idx + 1])
 
-    server = HTTPServer(("localhost", port), ViewerHandler)
-    print(f"人狼ビューア起動: http://localhost:{port}")
+    server = ThreadingHTTPServer(("localhost", port), ViewerHandler)
+    print(f"人狼ゲームサーバー起動: http://localhost:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

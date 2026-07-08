@@ -3,7 +3,7 @@
 get_player_view() の視点フィルターが正しく機能しているかを検証するユニットテスト。
 
 各テストは「知ってはいけない情報が1文字でも混入しないこと」を確認する。
-対象: logic_engine.get_player_view()
+対象: engine.get_player_view()
 """
 import json
 import os
@@ -12,7 +12,7 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from logic_engine import get_player_view
+from engine import get_player_view
 
 # ---------------------------------------------------------------------------
 # 共通テストデータ

@@ -1,0 +1,18 @@
+{
+  "backend": "cursor",
+  "models": {
+    "npc": "composer-2.5-fast",
+    "narration": "claude-opus-4-8-medium"
+  },
+  "cursor": {
+    "command": "cursor-agent",
+    "timeout_sec": 120,
+    "max_retries": 2
+  },
+  "gemini": {
+    "npc_model": "gemini-3-flash-preview",
+    "narration_model": "gemini-3.1-pro-preview",
+    "timeout_sec": 120,
+    "max_retries": 2
+  }
+}
