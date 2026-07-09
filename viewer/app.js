@@ -37,6 +37,7 @@
   const $aliveList = document.getElementById("alive-list");
   const $deadHeader = document.getElementById("dead-header");
   const $deadList = document.getElementById("dead-list");
+  const $voteList = document.getElementById("vote-list");
   const $privateList = document.getElementById("private-list");
   const $scenes = document.getElementById("scenes");
   const $main = document.getElementById("main");
@@ -96,15 +97,36 @@
     $actionStatus.className = isError ? "error" : "";
   }
 
+  // POST 完了後に必ず再取得するアクション
+  var SLOW_ACTIONS = {
+    "/api/say": false,
+    "/api/npc_speak": true,
+    "/api/continue": true,
+    "/api/vote": true,
+    "/api/night_action": true,
+    "/api/new_game": true,
+  };
+
+  function invalidateScenesFromResponse(data) {
+    if (!data) return;
+    if (data.scene) loadedScenes.delete(data.scene);
+    if (Array.isArray(data.scenes)) {
+      data.scenes.forEach(function (name) { loadedScenes.delete(name); });
+    }
+  }
+
   function sendAction(url, body, pendingText) {
     if (actionPending) return;
     actionPending = true;
     setStatus(pendingText || "処理中…（NPCが考えています）");
     setControlsDisabled(true);
-    isTyping = true;
+    if (SLOW_ACTIONS[url] !== false) {
+      isTyping = true;
+    }
 
     postJSON(url, body)
       .then(function (data) {
+        invalidateScenesFromResponse(data);
         setStatus("");
         if (data.seer_result) {
           var r = data.seer_result.result === "werewolf" ? "人狼" : "人狼ではない";
@@ -157,7 +179,8 @@
     var ui = state.ui || { mode: "unknown" };
     var busy = state.busy || actionPending;
     // busy 中は既存UIを無効化するだけで再構築しない（入力内容を保持）
-    var uiKey = ui.mode + ":" + (ui.need || "") + ":" + state.day + ":" + state.phase;
+    var uiKey = ui.mode + ":" + (ui.need || "") + ":" + state.day + ":" + state.phase
+      + ":" + (ui.npc_queue_remaining || 0) + ":" + (ui.player_co || "");
     if (uiKey === lastUiKey) {
       setControlsDisabled(busy);
       return;
@@ -177,8 +200,14 @@
 
     } else if (ui.mode === "discussion") {
       if (ui.can_speak) {
-        var input = el("input", { type: "text", placeholder: "発言する（Enterで送信）" });
-        var sayBtn = makeButton("発言", function () { submitSay(); });
+        var input = el("input", { type: "text", placeholder: "発言内容を入力…" });
+        var sayBtn = makeButton("発言する", function () { submitSay(); });
+        var npcBtn = makeButton("NPCに話させる", function () {
+          sendAction("/api/npc_speak", { mode: "one" }, "NPCが考えています…");
+        }, true);
+        var npcAllBtn = makeButton("全員発言", function () {
+          sendAction("/api/npc_speak", { mode: "all" }, "NPCが議論しています…");
+        }, true);
         var voteSel = makeSelect(ui.vote_candidates || [], "投票先…");
         var voteBtn = makeButton("投票へ", function () {
           if (!voteSel.value) { setStatus("投票先を選んでください", true); return; }
@@ -189,19 +218,83 @@
           var msg = input.value.trim();
           if (!msg) { setStatus("発言内容を入力してください", true); return; }
           input.value = "";
-          sendAction("/api/say", { message: msg }, "NPCが応答しています…");
+          sendAction("/api/say", { message: msg }, "発言を記録しました");
         }
         input.addEventListener("keydown", function (e) {
           if (e.key === "Enter" && !e.isComposing) submitSay();
         });
 
+        // CO宣言プルダウン（未COのときだけ表示。テンプレ文はサーバーが生成）
+        var CO_LABELS = { seer: "占い師", medium: "霊媒師", bodyguard: "狩人" };
+        var coSel = null;
+        if ((ui.co_options || []).length && !ui.player_co) {
+          coSel = el("select");
+          var coPh = el("option", { value: "" }, "CO宣言…");
+          coPh.disabled = true;
+          coPh.selected = true;
+          coSel.appendChild(coPh);
+          ui.co_options.forEach(function (role) {
+            coSel.appendChild(el("option", { value: role }, CO_LABELS[role] || role));
+          });
+          var coBtn = makeButton("COする", function () {
+            if (!coSel.value) { setStatus("CO する役職を選んでください", true); return; }
+            var msg = input.value.trim();
+            input.value = "";
+            sendAction("/api/say", { message: msg, co: coSel.value },
+              "CO を宣言しました");
+          }, true);
+        }
+
+        // 結果発表プルダウン（占い師/霊媒師でCO済みのときだけ表示）
+        var annTargetSel = null;
+        if (ui.can_announce_result) {
+          annTargetSel = makeSelect(ui.announce_candidates || [], "発表対象…");
+          var annResultSel = el("select");
+          var annPh = el("option", { value: "" }, "結果…");
+          annPh.disabled = true;
+          annPh.selected = true;
+          annResultSel.appendChild(annPh);
+          annResultSel.appendChild(el("option", { value: "white" }, "白（人間）"));
+          annResultSel.appendChild(el("option", { value: "black" }, "黒（人狼）"));
+          var annBtn = makeButton("結果発表", function () {
+            if (!annTargetSel.value) { setStatus("発表対象を選んでください", true); return; }
+            if (!annResultSel.value) { setStatus("結果（白/黒）を選んでください", true); return; }
+            var msg = input.value.trim();
+            input.value = "";
+            sendAction("/api/say", {
+              message: msg,
+              result_target: annTargetSel.value,
+              result: annResultSel.value,
+            }, "結果を発表しました");
+          }, true);
+        }
+
+        npcBtn.disabled = !ui.can_npc_speak;
         $actionControls.appendChild(input);
         $actionControls.appendChild(sayBtn);
+        if (coSel) {
+          $actionControls.appendChild(coSel);
+          $actionControls.appendChild(coBtn);
+        }
+        if (annTargetSel) {
+          $actionControls.appendChild(annTargetSel);
+          $actionControls.appendChild(annResultSel);
+          $actionControls.appendChild(annBtn);
+        }
+        $actionControls.appendChild(npcBtn);
+        $actionControls.appendChild(npcAllBtn);
         $actionControls.appendChild(voteSel);
         $actionControls.appendChild(voteBtn);
-        setStatus("");
+        var q = ui.npc_queue_remaining || 0;
+        if (q > 0) {
+          setStatus("NPCの発言待ち: 残り " + q + " 人");
+        } else if (ui.can_start_new_disc === false) {
+          setStatus("本日の議論は十分です。投票へ進んでください");
+        } else {
+          setStatus("発言するか、NPCに話させるか、投票へ進んでください");
+        }
       } else {
-        var contBtn = makeButton("議論を見守る（次のラウンドへ）", function () {
+        var contBtn = makeButton("NPC全員の発言を見る", function () {
           sendAction("/api/continue", {}, "NPCが議論しています…");
         });
         var skipBtn = makeButton("投票へ進む", function () {
@@ -343,6 +436,20 @@
       $deadList.innerHTML = '<li class="no-info">なし</li>';
     }
 
+    // Vote history
+    var votes = state.execution_history || [];
+    if (votes.length > 0) {
+      $voteList.innerHTML = votes.map(function (v) {
+        var breakdown = Object.keys(v.votes || {}).map(function (voter) {
+          return esc(voter) + "→" + esc(v.votes[voter]);
+        }).join(" / ");
+        return "<li><strong>Day" + v.day + "</strong> " + esc(v.target) +
+          " 処刑<span class=\"death-cause\">" + breakdown + "</span></li>";
+      }).join("");
+    } else {
+      $voteList.innerHTML = '<li class="no-info">なし</li>';
+    }
+
     // Private info
     if (state.private_info.length > 0) {
       $privateList.innerHTML = state.private_info.map(function (line) {
@@ -448,7 +555,7 @@
   }
 
   // ── Scene loading（差分更新対応）──
-  function loadScenes(sceneList, activeScene) {
+  function loadScenes(sceneList, activeScene, discussionScene) {
     // サーバー側で削除されたシーン（新規ゲーム開始時）をDOMから除去
     Object.keys(sceneDivs).forEach(function (name) {
       if (sceneList.indexOf(name) === -1) {
@@ -458,11 +565,16 @@
       }
     });
 
-    // 未ロードのシーン ＋ アクティブ（生成中）シーンを再取得対象にする
+    // 未ロードのシーン ＋ 追記中の議論シーン ＋ 生成中シーンを再取得
     var newScenes = sceneList.filter(function (name) {
       return !loadedScenes.has(name);
     });
-    var toRefresh = (activeScene && loadedScenes.has(activeScene)) ? [activeScene] : [];
+    var toRefresh = [];
+    [activeScene, discussionScene].forEach(function (name) {
+      if (name && loadedScenes.has(name) && toRefresh.indexOf(name) === -1) {
+        toRefresh.push(name);
+      }
+    });
     var toFetch = newScenes.slice();
     toRefresh.forEach(function (n) {
       if (toFetch.indexOf(n) === -1) toFetch.push(n);
@@ -538,8 +650,9 @@
 
       renderSidebar(results[0]);
       renderActionBar(results[0]);
+      var discussionScene = results[0].discussion_scene || null;
       // シーン更新が完了してからタイピングインジケータを末尾に表示
-      return loadScenes(results[1], activeScene).then(function () {
+      return loadScenes(results[1], activeScene, discussionScene).then(function () {
         renderTypingIndicator(typingData);
       });
     });

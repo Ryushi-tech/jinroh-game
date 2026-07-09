@@ -1,5 +1,8 @@
 # テスト
 pytest>=8.0
 
+# Claude API バックエンド（config.json で backend=anthropic）
+anthropic>=0.116.0
+
 # Gemini バックエンドを使う場合のみ必要（config.json で backend=gemini）
 google-genai>=1.0.0

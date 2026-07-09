@@ -16,9 +16,10 @@
 viewer/server.py（ゲームサーバー・視点フィルタ）
     ▼
 orchestrator.py（進行ループ・シーン生成・公開イベント記録）
-    ├── engine.py（ルール・状態遷移・視点フィルタ get_player_view）
-    ├── npc_agent.py（NPC発言生成: 逐次ターン制 + 再生成リトライ）
-    │       └── llm_backend.py（cursor-agent / Gemini / Fake アダプタ）
+    ├── engine.py（ルール・状態遷移・視点フィルタ get_player_view・疑惑スコア）
+    ├── speech_planner.py（発言内容の機械決定: 疑い先・根拠・論点・投票意思）
+    ├── npc_agent.py（口調レンダラー render_speech + 旧 generate_npc_message）
+    │       └── llm_backend.py（Claude API / cursor-agent / Gemini / Fake アダプタ）
     ├── validator.py（シーン検査: 死人発言・役職漏洩・フォーマット）
     └── scene_checks.py（投票整合・死者呼びかけ検出）
 ```
@@ -44,14 +45,15 @@ python3 viewer/server.py
 python3 autoplay.py --runs 5
 
 # 実LLMでの通しテスト
-python3 autoplay.py --runs 1 --backend cursor
+python3 autoplay.py --runs 1 --backend anthropic
 
 # ユニットテスト
 python3 -m pytest tests/
 ```
 
-LLMバックエンドは `config.json` の `backend` キーで切替（`cursor` / `gemini` / `fake`）。
+LLMバックエンドは `config.json` の `backend` キーで切替（`anthropic` / `cursor` / `gemini` / `fake`）。
 
+- `anthropic`（既定）: `.env` に `ANTHROPIC_API_KEY` が必要（`pip install anthropic`）
 - `cursor`: cursor-agent CLI が必要（`curl https://cursor.com/install -fsS | bash` → `cursor-agent login`）
 - `gemini`: `.env` に `GEMINI_API_KEY` が必要
 
@@ -62,7 +64,8 @@ LLMバックエンドは `config.json` の `backend` キーで切替（`cursor` 
 役職構成・勝利条件・進行ルールは `docs/game_rules.md` を参照。
 実装上の要点:
 
-- 9人村: 村人3・占い師1・霊媒師1・狩人1 / 人狼2・狂人1
+- 5人村: 村人2・占い師1 / 人狼1・狂人1（`engine.ROLE_COMPOSITION` で定義）
+- 霊媒師・狩人は現構成に不在（関連ロジックは find_role の None で自動スキップ）
 - 初日占いなし / 連続護衛禁止 / 同票はランダム決選
 - 霊媒結果は自動公開されない（霊媒師COによる発表のみ）
 - 襲撃死 = 人間確定。具体的役職は死亡時に公開されない
@@ -90,6 +93,19 @@ LLMバックエンドは `config.json` の `backend` キーで切替（`cursor` 
 
 ## 5. 生成の防御設計
 
+NPC議論・投票宣言は **内容を機械決定 → LLMは口調翻訳のみ** の2段構成:
+
+```
+speech_planner.build_speech_plan → npc_agent.render_speech（口調変換）
+    → 失敗時 plan["fallback_text"] をそのままシーンへ（沈黙しない）
+```
+
+- 発言内容: `speech_planner.py` が公開台帳・log・疑惑スコアから決定
+- 口調変換: `npc_agent.render_speech`（盤面全文は渡さない）
+- 投票理由: `speech_planner._grounded_reason` で機械決定、LLMは装飾のみ
+- 議論一括（`discussion_round` / `npc_speak_all`）も `npc_speak_one` 経由でプランナー方式
+- `generate_npc_message` は後方互換用に残存（通常進行では未使用）
+
 LLM出力の崩壊・逸脱は「必ず起きる」前提で多層防御する:
 
 ```
@@ -97,8 +113,8 @@ LLM出力 → [JSON抽出3層] → [内容検証] → [再生成リトライ(上
 ```
 
 - JSON抽出: `npc_agent.parse_json_bulletproof`（フェンス除去→全体→部分→regex救出）
-- 内容検証: 空メッセージ・死者名混入・かぎ括弧混入は**置換せず再生成**
-- リトライ超過はそのNPCのターンをスキップし、`error` として観測可能にする
+- 内容検証: 空メッセージ・死者名混入・かぎ括弧混入・must_mention 欠落は**置換せず再生成**
+- リトライ超過は `fallback_text`（議論）または機械理由付き定型文（投票）にフォールバック
 - シーンは `validator.validate_file` を通過したものだけが確定する
 
 **観測可能性**: LLMの全プロンプト・生レスポンスは `logs/debug_view.log` に、

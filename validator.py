@@ -115,8 +115,18 @@ def validate_file(narration_path, game_state=None):
                 executed_name = e["target"]
                 break
 
-    return validate(game_state, narration_text,
-                    is_epilogue=is_epilogue, executed_name=executed_name)
+    errors = validate(game_state, narration_text,
+                      is_epilogue=is_epilogue, executed_name=executed_name)
+
+    # 幕引き本体は語り部の地の文のみ（キャラ自白形式の役職漏洩を防ぐ）
+    if name == "scene_epilogue.txt":
+        player_names = [p["name"] for p in game_state["players"]]
+        if extract_speakers(narration_text, player_names):
+            errors.append(
+                "[エピローグ] 幕引きシーンにキャラクター発言（名前「」形式）を含めない"
+            )
+
+    return errors
 
 
 def main():

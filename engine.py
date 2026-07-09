@@ -32,9 +32,11 @@ ROLE_JP = {
     "medium": "霊媒師", "bodyguard": "狩人", "madman": "狂人",
 }
 
-ROLES_9 = [
-    "werewolf", "werewolf", "madman", "seer",
-    "medium", "bodyguard", "villager", "villager", "villager",
+# 5人村: 人狼1・狂人1 / 占い師1・村人2
+# （9人村から縮小。霊媒師・狩人は不在で、関連ロジックは find_role が
+#   None を返すことで自然にスキップされる）
+ROLE_COMPOSITION = [
+    "werewolf", "madman", "seer", "villager", "villager",
 ]
 
 ALL_NAMES = [
@@ -63,10 +65,21 @@ def load_state() -> dict:
         return json.load(f)
 
 
-def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """一時ファイルに書いてから os.replace で置換するアトミック書き込み。
+
+    truncate→write だと HTTP サーバーの GET スレッドが同時に読んだとき
+    壊れた JSON を読む可能性があるため。
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
         f.write("\n")
+    os.replace(tmp, path)
+
+
+def save_state(state: dict) -> None:
+    _atomic_write_json(STATE_FILE, state)
 
 
 def load_notes() -> dict:
@@ -78,9 +91,7 @@ def load_notes() -> dict:
 
 
 def save_notes(notes: dict) -> None:
-    with open(NOTES_FILE, "w", encoding="utf-8") as f:
-        json.dump(notes, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+    _atomic_write_json(NOTES_FILE, notes)
 
 
 def load_characters() -> list:
@@ -126,6 +137,25 @@ def last_guard_target(state: dict) -> str | None:
     return None
 
 
+def format_vote_breakdown(votes: dict[str, str]) -> str:
+    """投票者→投票先の一覧（各人1票）。シーン・盤面・UIの共通フォーマット。"""
+    if not votes:
+        return ""
+    return "、".join(f"{voter}→{target}"
+                       for voter, target in sorted(votes.items()))
+
+
+def format_execution_votes(votes: dict[str, str], executed: str, *,
+                           runoff: bool = False) -> str:
+    """投票シーン冒頭用の固定フォーマット。得票数ではなく個票を列挙する。"""
+    lines = ["―― 投票結果 ――"]
+    for voter in sorted(votes.keys()):
+        lines.append(f"{voter} → {votes[voter]}")
+    suffix = "（同票決選）" if runoff else ""
+    lines.append(f"処刑: {executed}{suffix}")
+    return "\n".join(lines)
+
+
 def win_status(state: dict) -> str:
     """'village' / 'werewolf' / 'none'"""
     alive = alive_players(state)
@@ -136,6 +166,28 @@ def win_status(state: dict) -> str:
     if wc >= oc:
         return "werewolf"
     return "none"
+
+
+def finalize_game(winner: str) -> None:
+    """勝敗確定後に phase を凍結する。orchestrator.epilogue から呼ぶ。"""
+    state = load_state()
+    state["phase"] = "epilogue"
+    save_state(state)
+
+
+def format_epilogue_scene(winner: str, state: dict) -> str:
+    """幕引きシーン本文（テンプレのみ。キャラ発言・LLM不使用）。"""
+    winner_jp = "村人陣営" if winner == "village" else "人狼陣営"
+    lines = [
+        f"長い争いに終止符が打たれた。勝者は【{winner_jp}】。",
+        "",
+        "── 全役職公開 ──",
+    ]
+    for p in state["players"]:
+        status = "生存" if p["alive"] else "死亡"
+        lines.append(f"{p['name']}: {ROLE_JP[p['role']]}（{status}）")
+    lines.extend(["", "こうして、村に静けさが戻った。"])
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -152,17 +204,23 @@ def setup_game(player_choice: str | None = None) -> dict:
 
     for f in glob.glob(str(BASE_DIR / "scene_*.txt")):
         os.remove(f)
+    # NPC思考ログは day/disc 名でしか区別されず、前ゲームの内容に
+    # マージ追記されてしまうため、ゲーム開始時に消す
+    # （debug_view.log は時系列追記なので残す）
+    for f in glob.glob(str(BASE_DIR / "logs" / "npc_thoughts_*.json")):
+        os.remove(f)
     if NOTES_FILE.exists():
         NOTES_FILE.unlink()
 
+    n_players = len(ROLE_COMPOSITION)
     if player_choice:
         others = [n for n in ALL_NAMES if n != player_choice]
-        selected = [player_choice] + random.sample(others, 8)
+        selected = [player_choice] + random.sample(others, n_players - 1)
     else:
-        selected = random.sample(ALL_NAMES, 9)
+        selected = random.sample(ALL_NAMES, n_players)
         player_choice = selected[0]
 
-    roles = ROLES_9[:]
+    roles = ROLE_COMPOSITION[:]
     random.shuffle(roles)
     players = [{"name": n, "role": r, "alive": True}
                for n, r in zip(selected, roles)]
@@ -189,21 +247,33 @@ def setup_game(player_choice: str | None = None) -> dict:
 # 内部確定情報・疑惑スコア（GM専用。UIに直接出さないこと）
 # ---------------------------------------------------------------------------
 
-def _confirmed_info(state: dict) -> tuple[list[str], list[str]]:
-    """内部視点の確定黒・確定白（生存占い師の結果 / 襲撃死 / 処刑霊媒）。"""
-    alive_names = {p["name"] for p in state["players"] if p["alive"]}
+def _confirmed_info(state: dict, notes: dict) -> tuple[list[str], list[str]]:
+    """公開情報（宣言台帳＋襲撃死）のみから確定黒・確定白を計算する。
+
+    log の真の占い結果・未発表の霊媒判定（execute の alignment）は使わない。
+    未発表情報で村NPCの投票が動くと、発表されていない真結果が
+    行動から逆算できてしまう神視点リークになるため。
+    材料は public_seer_claims / public_medium_results の宣言と、
+    襲撃死（=人間確定という公開ルール）のみ。
+    発表者（actor）が死亡していても宣言は有効なまま数える。
+    同一 target に黒と白の両方の宣言がある場合（対抗COの食い違い等）は
+    係争中とみなし、どちらからも除外する。
+    """
     black, white = [], []
+    for c in notes.get("public_seer_claims", []):
+        (black if c.get("result") == "人狼" else white).append(c["target"])
+    for r in notes.get("public_medium_results", []):
+        if r.get("result") == "werewolf":
+            black.append(r["target"])
+        elif r.get("result") == "human":
+            white.append(r["target"])
     for e in state["log"]:
-        if e["type"] == "seer":
-            if e.get("actor", "") not in alive_names:
-                continue
-            (black if e["result"] == "werewolf" else white).append(e["target"])
-        elif e["type"] == "attack" and e.get("result") == "killed":
+        if e["type"] == "attack" and e.get("result") == "killed":
             white.append(e["target"])
-        elif e["type"] == "execute" and e.get("alignment") == "werewolf":
-            black.append(e["target"])
-        elif e["type"] == "execute" and e.get("alignment") == "human":
-            white.append(e["target"])
+
+    disputed = set(black) & set(white)
+    black = [x for x in black if x not in disputed]
+    white = [x for x in white if x not in disputed]
 
     def _dedup(xs):
         seen = set()
@@ -213,8 +283,13 @@ def _confirmed_info(state: dict) -> tuple[list[str], list[str]]:
 
 
 def _suspicion_scores(state, alive, confirmed_white, confirmed_black,
-                      player, notes) -> dict[str, int]:
-    scores = {p["name"]: 0 for p in alive if p["name"] != player}
+                      notes) -> dict[str, int]:
+    """生存者全員の疑惑スコアを集計する。
+
+    プレイヤーも村の疑惑・合意先の対象に含める。
+    除外するとプレイヤーが構造的に吊られなくなる。
+    """
+    scores = {p["name"]: 0 for p in alive}
 
     for e in state["log"]:
         if e["type"] == "execute" and "tally" in e:
@@ -240,9 +315,120 @@ def _suspicion_scores(state, alive, confirmed_white, confirmed_black,
     return scores
 
 
+def compute_npc_suspicion(state: dict, notes: dict, player: str) -> dict:
+    """NPC各自の視点による疑惑スコアを機械計算する（LLM不使用）。
+
+    旧実装は LLM に1体ずつ「怪しい順スコアを出せ」と問い合わせていたが、
+    LLMの関与を口調の翻訳に限定する方針に伴い、公開情報の台帳
+    （public_seer_claims / public_co_claims / execute の votes）と
+    rater 自身の役職知識のみから決定的に計算する。
+
+    Returns: {"avg": {target: float}, "by_rater": {rater: {target: float}}}
+    rater = 生存NPC全員（プレイヤー除く）。
+    target = rater 以外の生存者全員（プレイヤー含む）。
+    """
+    alive = alive_players(state)
+    alive_names = {p["name"] for p in alive}
+    raters = [p for p in alive if p["name"] != player]
+
+    seer_claims = notes.get("public_seer_claims", [])
+    black_declared = {c["target"] for c in seer_claims
+                      if c.get("result") == "人狼"}
+    white_declared = {c["target"] for c in seer_claims
+                      if c.get("result") != "人狼"}
+    disputed = black_declared & white_declared
+
+    seer_co_names = {
+        n for n, info in notes.get("public_co_claims", {}).items()
+        if isinstance(info, dict) and info.get("role") == "seer"
+    }
+
+    _, all_white = _confirmed_info(state, notes)
+    confirmed_white = {n for n in all_white if n in alive_names}
+
+    # 直近の処刑の個票（単独投票・遺恨の判定に使う）
+    last_votes: dict[str, str] = {}
+    for e in reversed(state["log"]):
+        if e["type"] == "execute" and e.get("votes"):
+            last_votes = e["votes"]
+            break
+    vote_counts = Counter(last_votes.values())
+
+    by_rater: dict[str, dict[str, float]] = {}
+    for rp in raters:
+        r = rp["name"]
+        r_role = rp["role"]
+
+        teammates = {p["name"] for p in state["players"]
+                     if p["role"] == "werewolf" and p["name"] != r}
+        own_black: set[str] = set()
+        own_white: set[str] = set()
+        if r_role == "seer":
+            for e in state["log"]:
+                if e["type"] == "seer" and e.get("actor") == r:
+                    dest = own_black if e["result"] == "werewolf" else own_white
+                    dest.add(e["target"])
+        believed_wolf = None
+        if r_role == "madman":
+            # 推定狼 = 自分以外の actor（真占いの可能性が高い）による最新の黒宣言先
+            believed_wolf = next(
+                (c["target"] for c in reversed(seer_claims)
+                 if c.get("actor") != r and c.get("result") == "人狼"),
+                None)
+
+        rated: dict[str, float] = {}
+        for tp in alive:
+            t = tp["name"]
+            if t == r:
+                continue
+            score = 3.0
+            fixed = False  # 固定値はノイズを加えない（決定的な確信を表す）
+
+            # --- 公開情報ベース（全rater共通） ---
+            if t in black_declared:
+                score += 3 if t in disputed else 5
+            if len(seer_co_names) >= 2 and t in seer_co_names:
+                score += 2
+            if last_votes.get(t) and vote_counts[last_votes[t]] == 1:
+                score += 1  # 単独投票
+            if last_votes.get(t) == r:
+                score += 2  # 遺恨
+            if t in confirmed_white:
+                score, fixed = 1.0, True
+
+            # --- rater の役職知識（公開情報より優先） ---
+            if r_role == "werewolf" and t in teammates:
+                score, fixed = 1.0, True
+            elif r_role == "seer":
+                if t in own_black:
+                    score, fixed = 10.0, True
+                elif t in own_white:
+                    score, fixed = 1.0, True
+                elif t in seer_co_names and not fixed:
+                    score += 4  # 自分以外の占い師COは偽
+            elif r_role == "madman" and t == believed_wolf:
+                score, fixed = 1.0, True
+
+            if not fixed:
+                score += random.Random(f"{state['day']}:{r}:{t}").uniform(-0.5, 0.5)
+            rated[t] = round(min(10.0, max(1.0, score)), 2)
+        by_rater[r] = rated
+
+    totals: dict[str, list[float]] = {}
+    for rated in by_rater.values():
+        for t, v in rated.items():
+            totals.setdefault(t, []).append(v)
+    avg = {t: round(sum(vs) / len(vs), 2) for t, vs in totals.items()}
+    return {"avg": avg, "by_rater": by_rater}
+
+
 def _decide_counter_co(state: dict, notes: dict, player: str) -> list[str]:
-    """対抗CO判断（gm_helper.py から移植。確率パラメータ同一）。"""
-    if state["day"] > 2:
+    """対抗CO判断（gm_helper.py から移植。確率パラメータ同一）。
+
+    偽占い師COの割り当ては初日1回のみ。2日目以降に新規割り当てすると
+    既存の偽CO者と真占い師COが矛盾して破綻する。
+    """
+    if state["day"] > 1:
         return []
     if notes.get("counter_co_decided_day") == state["day"]:
         return []
@@ -290,12 +476,12 @@ def discussion_brief() -> dict:
     alive_set = {p["name"] for p in alive}
     notes = load_notes()
 
-    all_black, all_white = _confirmed_info(state)
+    all_black, all_white = _confirmed_info(state, notes)
     confirmed_black = [n for n in all_black if n in alive_set]
     confirmed_white = [n for n in all_white if n in alive_set]
 
     scores = _suspicion_scores(state, alive, confirmed_white, confirmed_black,
-                               player, notes)
+                               notes)
 
     counter_co = _decide_counter_co(state, notes, player)
     if counter_co:
@@ -335,19 +521,28 @@ def compute_vote_plan() -> str | None:
     投票直前に village_vote_target を決めるために使う。
     """
     state = load_state()
-    player = player_name()
     alive = alive_players(state)
     alive_set = {p["name"] for p in alive}
     notes = load_notes()
 
-    all_black, all_white = _confirmed_info(state)
+    all_black, all_white = _confirmed_info(state, notes)
     confirmed_black = [n for n in all_black if n in alive_set]
     confirmed_white = [n for n in all_white if n in alive_set]
 
     if confirmed_black:
         return confirmed_black[0]
     scores = _suspicion_scores(state, alive, confirmed_white, confirmed_black,
-                               player, notes)
+                               notes)
+    if state["day"] == 1:
+        seer_cos = [
+            n for n, info in notes.get("public_co_claims", {}).items()
+            if isinstance(info, dict) and info.get("role") == "seer"
+            and n in alive_set
+        ]
+        if len(seer_cos) >= 2:
+            pool = {n: scores[n] for n in seer_cos if n in scores}
+            if pool:
+                return max(pool, key=pool.get)
     if scores:
         return max(scores, key=scores.get)
     return None
@@ -371,17 +566,25 @@ def record_public_seer_claim(actor: str, target: str, result_jp: str, day: int) 
     「どのCO者の結果が本物か」が構造的に漏れるため、
     公開情報は必ずこの宣言記録を経由する。
     result_jp: '人狼' | '白（人間）'
+
+    同一 (actor, target, day) は再記録しない（シーン全文の再スキャンに対して冪等）。
     """
     notes = load_notes()
     claims = notes.setdefault("public_seer_claims", [])
+    if any(c["actor"] == actor and c["target"] == target and c["day"] == day
+           for c in claims):
+        return
     claims.append({"actor": actor, "target": target, "result": result_jp, "day": day})
     save_notes(notes)
 
 
 def record_public_medium_result(actor: str, target: str, result: str, day: int) -> None:
-    """result: 'werewolf' | 'human'"""
+    """result: 'werewolf' | 'human'（同一 actor/target/day は再記録しない）"""
     notes = load_notes()
     results = notes.setdefault("public_medium_results", [])
+    if any(r["actor"] == actor and r["target"] == target and r["day"] == day
+           for r in results):
+        return
     results.append({"actor": actor, "target": target, "result": result, "day": day})
     save_notes(notes)
 
@@ -569,14 +772,16 @@ def resolve_night(seer: str | None = None, guard: str | None = None,
                 "target": attack_target, "result": "killed",
             })
 
-    state["day"] += 1
-    state["phase"] = "day_discussion"
+    win = win_status(state)
+    if win == "none":
+        state["day"] += 1
+        state["phase"] = "day_discussion"
     save_state(state)
 
     return {
         "victim": victim,
         "guarded": guarded,
-        "win": win_status(state),
+        "win": win,
         "seer_result": seer_result,
         "day": state["day"],
         "phase": state["phase"],
@@ -608,38 +813,77 @@ def _village_vote_candidate(state, alive, me, village_vote_target=None) -> str |
 def decide_npc_votes(state: dict, notes: dict, player: str) -> dict[str, str]:
     """NPC全員の投票先を決定する（プレイヤー分は含まない）。"""
     alive = alive_players(state)
-    alive_names = {p["name"] for p in alive}
     wolf_names = {p["name"] for p in state["players"] if p["role"] == "werewolf"}
     village_vote_target = notes.get("village_vote_target")
-
-    co_claims = notes.get("public_co_claims", {})
-    seer_cos_public = [
-        n for n, info in co_claims.items()
-        if isinstance(info, dict) and info.get("role") == "seer"
-        and n in alive_names
-    ]
-    public_seer_co = seer_cos_public[0] if seer_cos_public else None
 
     votes: dict[str, str] = {}
     for p in alive:
         if p["name"] == player:
             continue
         if p["role"] == "werewolf":
+            # 潜伏最優先: 村の合意先に乗る。単独で占いCOへ入れる黒票は
+            # 実戦では即バレの負け筋なのでやらない。
             cands = [x["name"] for x in alive
                      if x["name"] not in wolf_names and x["name"] != p["name"]]
             if not cands:
                 continue
-            votes[p["name"]] = (
-                public_seer_co if public_seer_co and public_seer_co in cands
-                else random.choice(cands)
-            )
+            if village_vote_target in cands:
+                votes[p["name"]] = village_vote_target
+            else:
+                # 合意先が仲間狼（または未定）: 疑惑の高い村側へ票を逸らす
+                susp = notes.get("npc_suspicion_avg", {})
+                scored = [n for n in cands if n in susp]
+                votes[p["name"]] = (
+                    max(scored, key=susp.get) if scored else random.choice(cands)
+                )
         elif p["role"] == "madman":
-            cands = [x["name"] for x in alive
-                     if x["name"] != p["name"] and x["name"] != public_seer_co]
+            me = p["name"]
+            cands = [x["name"] for x in alive if x["name"] != me]
             if not cands:
-                cands = [x["name"] for x in alive if x["name"] != p["name"]]
-            if cands:
-                votes[p["name"]] = random.choice(cands)
+                continue
+            alive_set = {x["name"] for x in alive}
+            seer_claims = notes.get("public_seer_claims", [])
+            # 推定狼 = 他者（真占いの可能性が高い）による最新の黒宣言先。
+            # 自分の宣言は騙りと知っているので除外。
+            believed_wolf = next(
+                (c["target"] for c in reversed(seer_claims)
+                 if c["actor"] != me and c["result"] == "人狼"
+                 and c["target"] in alive_set and c["target"] != me),
+                None)
+            # 自分が白を出した相手には入れない（騙りの自己整合）
+            own_whites = {c["target"] for c in seer_claims
+                          if c["actor"] == me and c["result"] != "人狼"}
+            susp = notes.get("npc_suspicion_avg", {})
+            if believed_wolf:
+                others = [n for n in cands if n != believed_wolf]
+                if not others:
+                    votes[me] = believed_wolf  # 推定狼しか残っていない
+                elif len(alive) <= 3:
+                    # PP圏: 狼+狂で多数を握れる。推定狼を守り第三者へ票を合わせる
+                    votes[me] = max(others, key=lambda n: susp.get(n, 0))
+                else:
+                    # 通常時も推定狼への投票は避け、村に紛れる
+                    safe = [n for n in others if n not in own_whites] or others
+                    votes[me] = (village_vote_target
+                                 if village_vote_target in safe
+                                 else random.choice(safe))
+            else:
+                safe = [n for n in cands if n not in own_whites] or cands
+                votes[me] = (village_vote_target
+                             if village_vote_target in safe
+                             else random.choice(safe))
+        elif p["role"] == "seer":
+            # 真占い師は自分の黒結果（生存中）を最優先で吊りに行く
+            my_blacks = [e["target"] for e in state["log"]
+                         if e["type"] == "seer" and e.get("actor") == p["name"]
+                         and e["result"] == "werewolf"
+                         and any(x["name"] == e["target"] for x in alive)]
+            if my_blacks:
+                votes[p["name"]] = my_blacks[-1]
+            else:
+                target = _village_vote_candidate(state, alive, p["name"], village_vote_target)
+                if target:
+                    votes[p["name"]] = target
         else:
             target = _village_vote_candidate(state, alive, p["name"], village_vote_target)
             if target:
@@ -709,14 +953,8 @@ def resolve_vote(player_vote: str | None) -> dict:
             return "conviction"
         return "consensus" if t == village_vote_target else "pivot"
 
-    role_hint_map = {"werewolf": "wolf_strategic", "madman": "madman_disrupt"}
-    alive_role = {p["name"]: p["role"] for p in alive}
     npc_vote_details = {
-        voter: {
-            "target": t,
-            "reason": _reason(t),
-            "role_hint": role_hint_map.get(alive_role.get(voter, ""), "villager"),
-        }
+        voter: {"target": t, "reason": _reason(t)}
         for voter, t in npc_votes.items()
     }
 
@@ -772,39 +1010,17 @@ def get_player_view(state: dict, target_player: str, notes: dict) -> dict:
 
     public_co_claims: dict = notes.get("public_co_claims", {})
 
-    # 公開占い結果 = 真占い師（CO済み・生存）の log 由来結果
-    #             + 宣言記録（偽CO者の捏造結果を含む。orchestrator が記録）
-    # 偽CO者の結果を含めないと「結果を持たないCO者=偽」と構造的に漏れるため。
-    alive_set = set(alive_players_list)
-    co_seer_names = {
-        name for name, info in public_co_claims.items()
-        if isinstance(info, dict) and info.get("role") == "seer"
-        and name in alive_set
-    }
-    public_seer_results: list[dict] = []
-    for e in state["log"]:
-        if e["type"] == "seer" and e.get("actor", "") in co_seer_names:
-            result_jp = "人狼" if e["result"] == "werewolf" else "白（人間）"
-            public_seer_results.append({
-                "actor": e["actor"],
-                "target": e["target"],
-                "result": result_jp,
-                "day": e["day"],
-            })
-    seen = {(r["actor"], r["target"], r["day"]) for r in public_seer_results}
-    for c in notes.get("public_seer_claims", []):
-        if c.get("actor") not in alive_set:
-            continue
-        key = (c["actor"], c["target"], c["day"])
-        if key in seen:
-            continue
-        seen.add(key)
-        public_seer_results.append({
-            "actor": c["actor"],
-            "target": c["target"],
-            "result": c["result"],
-            "day": c["day"],
-        })
+    # 公開占い結果 = 宣言台帳（public_seer_claims）のみ。
+    # 発表は orchestrator がテンプレ挿入と同時に必ず記録するため、
+    # log の真結果をビューへ直接出す必要はない（出すと未発表の結果が
+    # 全員に漏れ、真偽COの区別も構造的に漏れる）。
+    # 発表済みの宣言は発表者の死後も公開情報として残す
+    # （噛まれた占い師の遺した結果で村が推理するのは人狼の根幹）。
+    public_seer_results: list[dict] = [
+        {"actor": c["actor"], "target": c["target"],
+         "result": c["result"], "day": c["day"]}
+        for c in notes.get("public_seer_claims", [])
+    ]
 
     public_medium_results: list = notes.get("public_medium_results", [])
 
@@ -834,11 +1050,31 @@ def get_player_view(state: dict, target_player: str, notes: dict) -> dict:
             for e in state["log"] if e["type"] == "execute"
         ]
     elif role == "bodyguard":
+        # success = 同じ日・同じ対象への襲撃が guarded で終わったこと
         private["guard_history"] = [
-            {"day": e["day"], "target": e["target"]}
+            {
+                "day": e["day"], "target": e["target"],
+                "success": any(
+                    a["type"] == "attack" and a["day"] == e["day"]
+                    and a["target"] == e["target"]
+                    and a.get("result") == "guarded"
+                    for a in state["log"]
+                ),
+            }
             for e in state["log"]
             if e["type"] == "guard" and e.get("actor") == target_player
         ]
+    elif role == "werewolf":
+        # 人狼は自陣営の襲撃結果（成功/護衛された）を知っている
+        private["attack_history"] = [
+            {"day": e["day"], "target": e["target"], "result": e.get("result")}
+            for e in state["log"] if e["type"] == "attack"
+        ]
+
+    # 役職構成は全員に公開のセットアップ情報（誰がどれかは含まない）
+    composition: dict[str, int] = {}
+    for q in state["players"]:
+        composition[q["role"]] = composition.get(q["role"], 0) + 1
 
     return {
         "day": state["day"],
@@ -847,6 +1083,7 @@ def get_player_view(state: dict, target_player: str, notes: dict) -> dict:
             "role": role,
             "role_jp": role_jp,
         },
+        "role_composition": composition,
         "wolf_teammates": wolf_teammates,
         "alive_players": alive_players_list,
         "dead_players": dead_players,

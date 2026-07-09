@@ -39,21 +39,13 @@ TYPING_FILE = os.path.join(PROJECT_ROOT, ".typing_now")
 
 import engine
 from engine import GameError
-from orchestrator import Orchestrator, OrchestratorError
-
-ROLE_JP = {
-    "villager": "村人",
-    "werewolf": "人狼",
-    "seer": "占い師",
-    "bodyguard": "狩人",
-    "madman": "狂人",
-    "medium": "霊媒師",
-}
+from orchestrator import Orchestrator, OrchestratorError, MAX_DISC_ROUNDS_PER_DAY
 
 PHASE_JP = {
     "night": "夜",
     "day_discussion": "昼・議論",
     "day_vote": "昼・投票",
+    "epilogue": "エピローグ",
 }
 
 CONTENT_TYPES = {
@@ -123,49 +115,35 @@ def public_death_info(state):
 
 
 def private_info(state, player):
-    """役職固有の秘密情報（プレイヤー本人にのみ返す）。"""
-    role = player["role"]
+    """役職固有の秘密情報（プレイヤー本人にのみ返す）。
+
+    視点フィルタは engine.get_player_view() に一元化されており、
+    ここではその出力を表示用文字列に整形するだけ。
+    """
+    view = engine.get_player_view(state, player["name"], engine.load_notes())
+    role = view["self"]["role"]
+    private = view["private"]
     info = []
 
     if role == "seer":
-        for entry in state["log"]:
-            if entry["type"] == "seer" and entry["actor"] == player["name"]:
-                result_jp = "人狼" if entry["result"] == "werewolf" else "人狼ではない"
-                info.append(f"Night {entry['day']}: {entry['target']} → {result_jp}")
+        for r in private.get("seer_results", []):
+            info.append(f"Night {r['day']}: {r['target']} → {r['result']}")
 
     elif role == "bodyguard":
-        for entry in state["log"]:
-            if entry["type"] == "guard" and entry["actor"] == player["name"]:
-                success = any(
-                    e["type"] == "attack"
-                    and e["day"] == entry["day"]
-                    and e["target"] == entry["target"]
-                    and e.get("result") == "guarded"
-                    for e in state["log"]
-                )
-                mark = " ★護衛成功" if success else ""
-                info.append(f"Night {entry['day']}: {entry['target']} を護衛{mark}")
+        for g in private.get("guard_history", []):
+            mark = " ★護衛成功" if g["success"] else ""
+            info.append(f"Night {g['day']}: {g['target']} を護衛{mark}")
 
     elif role == "werewolf":
-        allies = [p["name"] for p in state["players"]
-                  if p["role"] == "werewolf" and p["name"] != player["name"]]
-        if allies:
-            info.append(f"仲間の人狼: {', '.join(allies)}")
-        for entry in state["log"]:
-            if entry["type"] == "attack":
-                result_jp = "護衛された" if entry.get("result") == "guarded" else "成功"
-                info.append(f"Night {entry['day']}: {entry['target']} を襲撃 → {result_jp}")
+        if view["wolf_teammates"]:
+            info.append(f"仲間の人狼: {', '.join(view['wolf_teammates'])}")
+        for a in private.get("attack_history", []):
+            result_jp = "護衛された" if a["result"] == "guarded" else "成功"
+            info.append(f"Night {a['day']}: {a['target']} を襲撃 → {result_jp}")
 
     elif role == "medium":
-        for entry in state["log"]:
-            if entry["type"] == "execute":
-                alignment = entry.get("alignment")
-                if alignment:
-                    result_jp = "人狼" if alignment == "werewolf" else "人間"
-                else:
-                    target = get_player(state, entry["target"])
-                    result_jp = "人狼" if target["role"] == "werewolf" else "人間"
-                info.append(f"Day {entry['day']} 処刑: {entry['target']} → {result_jp}")
+        for r in private.get("medium_results", []):
+            info.append(f"Day {r['day']} 処刑: {r['target']} → {r['result']}")
 
     elif role == "madman":
         info.append("※ 人狼が誰かは分かりません。勘と推理で人狼陣営を勝利に導いてください。")
@@ -196,10 +174,37 @@ def _ui_hint(state, player, game_over):
     if phase == "day_discussion":
         alive_names = [p["name"] for p in state["players"]
                        if p["alive"] and p["name"] != player["name"]]
+        notes = engine.load_notes()
+        queue_remaining = len(notes.get("discussion_queue") or [])
+        # CO宣言プルダウン: 村の構成に存在する特殊役職のみ選択肢に出す
+        # （真偽は問わない＝騙りCOも同じUIから行う）
+        comp_roles = {p["role"] for p in state["players"]}
+        co_options = [r for r in ("seer", "medium", "bodyguard") if r in comp_roles]
+        player_co = (notes.get("public_co_claims", {})
+                     .get(player["name"]) or {}).get("role")
+        # 結果発表UI: 占い師/霊媒師でCO済みのときのみ。対象は死者含む他全員
+        # （夜に占った相手が朝死んでいることがある）
+        can_announce = player_alive and player_co in ("seer", "medium")
+        announce_candidates = [p["name"] for p in state["players"]
+                               if p["name"] != player["name"]]
+        disc_count = len([
+            f for f in os.listdir(PROJECT_ROOT)
+            if f.startswith(f"scene_day{state['day']}_disc") and f.endswith(".txt")
+        ])
+        can_new_disc = disc_count < MAX_DISC_ROUNDS_PER_DAY
         return {
             "mode": "discussion",
             "can_speak": player_alive,
+            "can_npc_speak": queue_remaining > 0,
+            "npc_queue_remaining": queue_remaining,
+            "can_start_new_disc": can_new_disc,
+            "disc_rounds": disc_count,
+            "max_disc_rounds": MAX_DISC_ROUNDS_PER_DAY,
             "vote_candidates": alive_names if player_alive else [],
+            "co_options": co_options if player_alive else [],
+            "player_co": player_co,
+            "can_announce_result": can_announce,
+            "announce_candidates": announce_candidates if can_announce else [],
         }
     if phase == "day_vote":
         alive_names = [p["name"] for p in state["players"]
@@ -254,7 +259,7 @@ def build_filtered_state():
                 entry = {"name": p["name"]}
                 if game_over:
                     entry["role"] = p["role"]
-                    entry["role_jp"] = ROLE_JP.get(p["role"], p["role"])
+                    entry["role_jp"] = engine.ROLE_JP.get(p["role"], p["role"])
                 alive.append(entry)
 
         deaths = public_death_info(state)
@@ -263,7 +268,18 @@ def build_filtered_state():
                 target = get_player(state, d["name"])
                 if target:
                     d["role"] = target["role"]
-                    d["role_jp"] = ROLE_JP.get(target["role"], target["role"])
+                    d["role_jp"] = engine.ROLE_JP.get(target["role"], target["role"])
+
+    execution_history = []
+    if state:
+        for e in state["log"]:
+            if e["type"] == "execute":
+                execution_history.append({
+                    "day": e["day"],
+                    "target": e["target"],
+                    "votes": e.get("votes", {}),
+                    "tally": e.get("tally", {}),
+                })
 
     result = {
         "day": state["day"] if state else 0,
@@ -273,16 +289,26 @@ def build_filtered_state():
         "player": None,
         "alive": alive,
         "deaths": deaths,
+        "execution_history": execution_history,
         "private_info": [],
         "busy": _game_lock.locked(),
         "ui": _ui_hint(state, player, game_over),
     }
 
+    if state and state.get("phase") == "day_discussion":
+        try:
+            notes = engine.load_notes()
+            active = notes.get("active_disc_scene")
+            if active:
+                result["discussion_scene"] = active
+        except Exception:
+            pass
+
     if player:
         result["player"] = {
             "name": player["name"],
             "role": player["role"],
-            "role_jp": ROLE_JP.get(player["role"], player["role"]),
+            "role_jp": engine.ROLE_JP.get(player["role"], player["role"]),
             "alive": player["alive"],
         }
         result["private_info"] = private_info(state, player)
@@ -389,17 +415,49 @@ def action_new_game(body: dict) -> dict:
 
 def action_say(body: dict) -> dict:
     message = (body.get("message") or "").strip()
-    if not message:
+    co_role = (body.get("co") or "").strip() or None
+    result_target = (body.get("result_target") or "").strip() or None
+    result_value = (body.get("result") or "").strip() or None  # "white" | "black"
+    if not message and not co_role and not result_target:
         raise GameError("発言内容が空です")
+    result_black = None
+    if result_target:
+        if result_value not in ("white", "black"):
+            raise GameError("結果（白/黒）を選んでください")
+        result_black = result_value == "black"
     orch = get_orchestrator()
-    result = orch.discussion_round(message)
+    result = orch.player_say(
+        message, co_role=co_role,
+        result_target=result_target, result_black=result_black,
+    )
+    return {"ok": True, **result}
+
+
+def action_npc_speak(body: dict) -> dict:
+    orch = get_orchestrator()
+    mode = (body.get("mode") or "one").strip()
+    if mode == "all":
+        result = orch.npc_speak_all()
+    else:
+        result = orch.npc_speak_one()
     return {"ok": True, **result}
 
 
 def action_continue(body: dict) -> dict:
-    """発言せずに議論ラウンドを回す（プレイヤー死亡時・様子見）。"""
+    """発言せずにNPC全員の発言を一括生成（プレイヤー死亡時・様子見）。
+
+    前ラウンドのキューを消費済みなら新しい議論ラウンドを開始する。
+    """
     orch = get_orchestrator()
-    result = orch.discussion_round(None)
+    state = engine.load_state()
+    notes = engine.load_notes()
+    player = engine.player_name()
+    queue_exhausted = (
+        notes.get("discussion_day") == state["day"]
+        and not notes.get("discussion_queue")
+    )
+    orch._ensure_disc_session(state, notes, player, force_new=queue_exhausted)
+    result = orch.npc_speak_all()
     return {"ok": True, **result}
 
 
@@ -445,6 +503,7 @@ def action_night(body: dict) -> dict:
 POST_ACTIONS = {
     "/api/new_game": action_new_game,
     "/api/say": action_say,
+    "/api/npc_speak": action_npc_speak,
     "/api/continue": action_continue,
     "/api/vote": action_vote,
     "/api/night_action": action_night,

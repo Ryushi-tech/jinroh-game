@@ -99,20 +99,44 @@ def check_discussion_text(state_at_start: dict, disc_text: str) -> list[str]:
     all_known_names = [p["name"] for p in players]
     dead_at_start = [p["name"] for p in players if not p["alive"]]
 
+    def resolve(katakana_run: str) -> str | None:
+        """カタカナ連続列から既知の名前を解決する。
+
+        貪欲マッチで前置きのカタカナ語が混入するため（例: リーダーのヴァルター）、
+        末尾一致で既知名を探す。見つからなければ None（=幽霊）。
+        """
+        if katakana_run in all_known_names:
+            return katakana_run
+        for n in all_known_names:
+            if katakana_run.endswith(n):
+                return n
+        return None
+
     # 名前 + 敬称(さん/君/様) で呼ばれている固有名詞を抽出
-    calls = re.findall(r"([ア-ンー]{2,})(?:さん|君|様)", disc_text)
-    for called_name in calls:
-        if called_name in all_known_names:
-            if called_name in dead_at_start:
-                errors.append(f"DEAD_TALK: 既に死んでいる {called_name} に話しかけています")
-        else:
-            errors.append(f"GHOST_TALK: 存在しない {called_name} に話しかけています")
+    # 「ヴ」(U+30F4) や小書き文字を含む名前に対応するため ァ-ヴ の範囲を使う
+    #
+    # GHOST_TALK: 存在しない名前は敬称付きで出てくること自体が幻覚なので言及でも検出。
+    # DEAD_TALK: 死者への正当な言及（「◯◯さんの遺した結果」）は許容し、
+    #            「生存者扱い」（呼びかけ・質問・発言要求）が続く場合のみ検出する。
+    for m in re.finditer(r"([ァ-ヴー]{2,})((?:さん|君|様)?)", disc_text):
+        called_run, honorific = m.group(1), m.group(2)
+        called_name = resolve(called_run)
+        if called_name is None:
+            if honorific:
+                errors.append(f"GHOST_TALK: 存在しない {called_run} に話しかけています")
+            continue
+        if called_name not in dead_at_start:
+            continue
+        rest = disc_text[m.end():]
+        if re.match(r"[、,]|はどう思|に聞|に質問|答えて", rest):
+            errors.append(f"DEAD_TALK: 既に死んでいる {called_name} に話しかけています")
 
     # 存在しない人物・死者への「投票宣言」チェック
-    vote_matches = re.findall(r"([ア-ンー]{2,})(?:に投票|にします|に一票)", disc_text)
-    for target_name in vote_matches:
-        if target_name not in all_known_names:
-            errors.append(f"GHOST_TALK: 存在しない {target_name} への投票を宣言しています")
+    vote_matches = re.findall(r"([ァ-ヴー]{2,})(?:に投票|にします|に一票)", disc_text)
+    for target_run in vote_matches:
+        target_name = resolve(target_run)
+        if target_name is None:
+            errors.append(f"GHOST_TALK: 存在しない {target_run} への投票を宣言しています")
         elif target_name in dead_at_start:
             errors.append(f"DEAD_TALK: 死者 {target_name} への投票を宣言しています")
 

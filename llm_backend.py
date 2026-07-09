@@ -4,13 +4,19 @@
 共通IF:
     backend.complete(prompt, *, system=None, model=None, expect_json=False) -> str
 
-実装:
-    CursorBackend : cursor-agent -p（Cursorサブスク）。隔離workspaceで実行し
-                    リポジトリの game_state.json 等を読めないよう物理遮断する。
-    GeminiBackend : google-genai SDK（.env の GEMINI_API_KEY）
-    FakeBackend   : テスト・autoplay 用の決定的スタブ
+    prompt は str のほか、セグメントの list も受け付ける:
+        [{"text": "...", "cache": True}, {"text": "...", "cache": False}]
+    cache=True のセグメントは AnthropicBackend でプロンプトキャッシュの
+    breakpoint になる（他バックエンドでは単に連結される）。
 
-選択は config.json の "backend" キー（cursor / gemini / fake）。
+実装:
+    CursorBackend    : cursor-agent -p（Cursorサブスク）。隔離workspaceで実行し
+                       リポジトリの game_state.json 等を読めないよう物理遮断する。
+    AnthropicBackend : Claude API（.env の ANTHROPIC_API_KEY）
+    GeminiBackend    : google-genai SDK（.env の GEMINI_API_KEY）
+    FakeBackend      : テスト・autoplay 用の決定的スタブ
+
+選択は config.json の "backend" キー（cursor / anthropic / gemini / fake）。
 モデルは用途別に "models": {"npc": ..., "narration": ...} で指定する。
 """
 
@@ -38,6 +44,15 @@ DEFAULT_CONFIG = {
         "timeout_sec": 120,
         "max_retries": 2,
     },
+    "anthropic": {
+        "npc_model": "claude-haiku-4-5-20251001",
+        "narration_model": "claude-sonnet-5",
+        "max_tokens": 1024,
+        "timeout_sec": 120,
+        "max_retries": 2,
+        "cache": True,
+        "cache_ttl": "5m",
+    },
     "gemini": {
         "npc_model": "gemini-3-flash-preview",
         "narration_model": "gemini-3.1-pro-preview",
@@ -45,6 +60,25 @@ DEFAULT_CONFIG = {
         "max_retries": 2,
     },
 }
+
+
+def _load_env_file() -> None:
+    """.env のキーを環境変数へ読み込む（既存の環境変数を優先）。"""
+    env_path = BASE_DIR / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if "=" in line and not line.startswith("#"):
+            k, _, v = line.partition("=")
+            os.environ.setdefault(k.strip(), v.strip().strip('"'))
+
+
+def join_prompt(prompt) -> str:
+    """セグメントlist形式のプロンプトを単一文字列に落とす（str はそのまま）。"""
+    if isinstance(prompt, str):
+        return prompt
+    return "\n\n".join(seg["text"] for seg in prompt if seg.get("text"))
 
 
 class LLMError(Exception):
@@ -100,8 +134,9 @@ class CursorBackend:
         except Exception:
             pass
 
-    def complete(self, prompt: str, *, system: str | None = None,
+    def complete(self, prompt, *, system: str | None = None,
                  model: str | None = None, expect_json: bool = False) -> str:
+        prompt = join_prompt(prompt)
         full_prompt = f"{system}\n\n{prompt}" if system else prompt
         if expect_json:
             full_prompt += (
@@ -185,6 +220,151 @@ class CursorBackend:
 
 
 # ---------------------------------------------------------------------------
+# Anthropic (Claude API) バックエンド
+# ---------------------------------------------------------------------------
+
+class AnthropicBackend:
+    """Claude API を直接呼ぶ（.env の ANTHROPIC_API_KEY）。
+
+    プロンプトのみを渡す（リポジトリへのアクセス経路が存在しないため
+    CursorBackend のような workspace 隔離は不要）。
+
+    プロンプトキャッシュ（config: anthropic.cache, 既定 true）:
+    - segments形式プロンプトの cache=True 部分に明示 breakpoint を置き、
+      さらにリクエスト全体へ自動キャッシュ（top-level cache_control）を併用する。
+    - 同一NPCの連続ターン・再生成リトライで安定プレフィックスが再利用される。
+    - モデルごとの最小キャッシュ長未満は API 側で黙って素通しされる（無害）。
+    - 効果は logs/debug_view.log の LLM_USAGE 行
+      （cache_write / cache_read トークン）で観測できる。
+    """
+
+    def __init__(self, config: dict):
+        c = config.get("anthropic", {})
+        self.npc_model = c.get("npc_model", "claude-haiku-4-5-20251001")
+        self.narration_model = c.get("narration_model", "claude-sonnet-5")
+        self.max_tokens = c.get("max_tokens", 1024)
+        self.timeout_sec = c.get("timeout_sec", 120)
+        self.max_retries = c.get("max_retries", 2)
+        self.cache_enabled = c.get("cache", True)
+        # "5m"（既定・追加指定なし）または "1h"（書き込み2倍コスト）
+        self.cache_ttl = c.get("cache_ttl", "5m")
+        self._client = None
+
+    def _cache_control(self) -> dict:
+        cc = {"type": "ephemeral"}
+        if self.cache_ttl == "1h":
+            cc["ttl"] = "1h"
+        return cc
+
+    @staticmethod
+    def _log_usage(model: str, usage) -> None:
+        """キャッシュ効果の観測用に usage を debug ログへ追記する。"""
+        try:
+            line = (
+                f"model={model} input={getattr(usage, 'input_tokens', '?')} "
+                f"cache_write={getattr(usage, 'cache_creation_input_tokens', 0) or 0} "
+                f"cache_read={getattr(usage, 'cache_read_input_tokens', 0) or 0} "
+                f"output={getattr(usage, 'output_tokens', '?')}"
+            )
+            log_dir = BASE_DIR / "logs"
+            log_dir.mkdir(exist_ok=True)
+            with open(log_dir / "debug_view.log", "a", encoding="utf-8") as f:
+                f.write(f"\n===== LLM_USAGE =====\n{line}\n")
+        except Exception:
+            pass  # 観測ログの失敗で本処理を止めない（呼び出し自体は成功している）
+
+    def _ensure_client(self):
+        if self._client is not None:
+            return
+        _load_env_file()
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise LLMError("ANTHROPIC_API_KEY が設定されていません（.env を確認）")
+        try:
+            import anthropic
+        except ImportError:
+            raise LLMError(
+                "anthropic パッケージが未導入です: pip install anthropic"
+            )
+        # SDK 内リトライは自前リトライと重複するため無効化
+        self._client = anthropic.Anthropic(
+            timeout=self.timeout_sec, max_retries=0,
+        )
+
+    def _build_content(self, prompt, expect_json: bool) -> list[dict]:
+        """プロンプトを content ブロック列に変換する。
+
+        segments形式なら cache=True ブロックへ明示 breakpoint を付与
+        （明示は最大3個。自動キャッシュ分と合わせ上限4を超えないため）。
+        """
+        json_suffix = (
+            "\n\n重要: 出力はJSONオブジェクトのみ。"
+            "コードブロック記号・前置き・後書きは一切禁止。"
+        ) if expect_json else ""
+
+        if isinstance(prompt, str):
+            return [{"type": "text", "text": prompt + json_suffix}]
+
+        blocks = []
+        explicit = 0
+        for seg in prompt:
+            text = seg.get("text", "")
+            if not text:
+                continue
+            block: dict = {"type": "text", "text": text}
+            if self.cache_enabled and seg.get("cache") and explicit < 3:
+                block["cache_control"] = self._cache_control()
+                explicit += 1
+            blocks.append(block)
+        if not blocks:
+            blocks = [{"type": "text", "text": ""}]
+        blocks[-1]["text"] += json_suffix
+        return blocks
+
+    def complete(self, prompt, *, system: str | None = None,
+                 model: str | None = None, expect_json: bool = False) -> str:
+        self._ensure_client()
+        model = model or self.npc_model
+
+        kwargs: dict = {
+            "model": model,
+            "max_tokens": self.max_tokens,
+            "messages": [{
+                "role": "user",
+                "content": self._build_content(prompt, expect_json),
+            }],
+            "temperature": 0.7,
+        }
+        if system:
+            kwargs["system"] = system
+        if self.cache_enabled:
+            # 自動キャッシュ: 最後の cacheable ブロックへ breakpoint を自動付与
+            kwargs["extra_body"] = {"cache_control": self._cache_control()}
+
+        last_err = None
+        for attempt in range(1, self.max_retries + 2):
+            try:
+                resp = self._client.messages.create(**kwargs)
+                self._log_usage(model, resp.usage)
+                text = "".join(
+                    b.text for b in resp.content if getattr(b, "type", "") == "text"
+                ).strip()
+                if text:
+                    return text
+                last_err = "empty response"
+            except Exception as e:
+                last_err = str(e)
+                # 新しいモデルは temperature 非対応 → 外して即時リトライ
+                if "temperature" in last_err and "temperature" in kwargs:
+                    kwargs.pop("temperature")
+                    continue
+                # レート制限・過負荷は長めに待つ
+                wait = 10 if ("429" in last_err or "overloaded" in last_err.lower()) \
+                    else min(2 * attempt, 15)
+                time.sleep(wait)
+        raise LLMError(f"Claude API 呼び出し失敗（{self.max_retries + 1}回試行）: {last_err}")
+
+
+# ---------------------------------------------------------------------------
 # Gemini バックエンド
 # ---------------------------------------------------------------------------
 
@@ -199,22 +379,17 @@ class GeminiBackend:
     def _ensure_client(self):
         if self._client is not None:
             return
-        if not os.environ.get("GEMINI_API_KEY"):
-            env_path = BASE_DIR / ".env"
-            if env_path.exists():
-                for line in env_path.read_text(encoding="utf-8").splitlines():
-                    if "=" in line and not line.strip().startswith("#"):
-                        k, _, v = line.partition("=")
-                        os.environ.setdefault(k.strip(), v.strip().strip('"'))
+        _load_env_file()
         if not os.environ.get("GEMINI_API_KEY"):
             raise LLMError("GEMINI_API_KEY が設定されていません（.env を確認）")
         from google import genai
         self._client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-    def complete(self, prompt: str, *, system: str | None = None,
+    def complete(self, prompt, *, system: str | None = None,
                  model: str | None = None, expect_json: bool = False) -> str:
         self._ensure_client()
         from google.genai import types
+        prompt = join_prompt(prompt)
         model = model or self.npc_model
 
         cfg = types.GenerateContentConfig(
@@ -248,8 +423,9 @@ class FakeBackend:
         self.responder = responder
         self.calls: list[dict] = []
 
-    def complete(self, prompt: str, *, system: str | None = None,
+    def complete(self, prompt, *, system: str | None = None,
                  model: str | None = None, expect_json: bool = False) -> str:
+        prompt = join_prompt(prompt)
         self.calls.append({
             "prompt": prompt, "system": system,
             "model": model, "expect_json": expect_json,
@@ -271,6 +447,7 @@ class FakeBackend:
 
 _BACKENDS = {
     "cursor": CursorBackend,
+    "anthropic": AnthropicBackend,
     "gemini": GeminiBackend,
     "fake": FakeBackend,
 }
@@ -280,7 +457,7 @@ def create_backend(config: dict | None = None):
     config = config or load_config()
     name = config.get("backend", "cursor")
     if name not in _BACKENDS:
-        raise LLMError(f"不明なバックエンド: {name}（cursor / gemini / fake）")
+        raise LLMError(f"不明なバックエンド: {name}（cursor / anthropic / gemini / fake）")
     return _BACKENDS[name](config)
 
 
@@ -289,7 +466,8 @@ def model_for(config: dict, purpose: str) -> str | None:
     m = config.get("models", {}).get(purpose)
     if m:
         return m
-    if config.get("backend") == "gemini":
-        g = config.get("gemini", {})
-        return g.get(f"{purpose}_model")
+    backend = config.get("backend")
+    if backend in ("anthropic", "gemini"):
+        b = config.get(backend, {})
+        return b.get(f"{purpose}_model")
     return None

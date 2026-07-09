@@ -189,11 +189,12 @@ def test_07_unco_seer_result_excluded():
 
 
 # ---------------------------------------------------------------------------
-# テスト 8: 死亡したCO済み占い師の結果は public_seer_results に出ない
+# テスト 8: log の真結果はビューへ出ない／発表済み宣言は発表者の死後も残る
 # ---------------------------------------------------------------------------
 
-def test_08_dead_co_seer_result_excluded():
-    """CO済みでも死亡した占い師の結果が public_seer_results に含まれないこと。"""
+def test_08_dead_seer_log_hidden_but_claims_survive():
+    """公開占い結果は宣言台帳のみ。log の真結果は死亡CO者でも出ず、
+    発表済みの宣言（public_seer_claims）は発表者の死後も残ること。"""
     players_dead_seer = [
         _p("アリス",   "werewolf"),
         _p("ボブ",     "werewolf"),
@@ -201,11 +202,23 @@ def test_08_dead_co_seer_result_excluded():
         _p("エミリー", "villager"),
         _p("グレイス", "madman"),
     ]
-    # notes の public_co_claims にはカールの CO 記録が残ったまま
+    # 宣言台帳が空なら、log にカールの真結果があってもビューへ出ない
     view = get_player_view(_make_state(players_dead_seer, LOG), "エミリー", NOTES)
     actors = [r["actor"] for r in view["public_seer_results"]]
     assert "カール" not in actors, (
-        f"死亡したCO済み占い師カールの結果が漏洩: {view['public_seer_results']}"
+        f"未発表の log 真結果が漏洩: {view['public_seer_results']}"
+    )
+
+    # 発表済みの宣言は発表者（カール）が死亡しても公開情報として残る
+    notes_with_claim = dict(NOTES)
+    notes_with_claim["public_seer_claims"] = [
+        {"actor": "カール", "target": "アリス", "result": "人狼", "day": 1},
+    ]
+    view2 = get_player_view(
+        _make_state(players_dead_seer, LOG), "エミリー", notes_with_claim)
+    actors2 = [r["actor"] for r in view2["public_seer_results"]]
+    assert "カール" in actors2, (
+        f"死亡した占い師の発表済み宣言が消えている: {view2['public_seer_results']}"
     )
 
 

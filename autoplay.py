@@ -157,7 +157,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--backend", default="fake",
-                        choices=["fake", "cursor", "gemini"],
+                        choices=["fake", "cursor", "anthropic", "gemini"],
                         help="LLMバックエンド（既定: fake）")
     parser.add_argument("--player", default="オットー")
     args = parser.parse_args()
